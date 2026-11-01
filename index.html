@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tatkal Booking Consistency</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --navy: #0e2347;
+    --rail: #1d4f91;
+    --amber: #f5a623;
+    --amber-deep: #b87400;
+    --paper: #eef1f6;
+    --card: #ffffff;
+    --ink: #14213a;
+    --muted: #4f5d75;
+    --rule: #cfd7e4;
+    --soft: #e4e9f1;
+    --loss: #b3261e;
+    --loss-bg: #fbe4e1;
+    --safe: #187a4f;
+    --safe-bg: #dcf0e5;
+    --wait: #8a5a00;
+    --wait-bg: #fbeccb;
+    --focus: #0b57d0;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 "Instrument Sans", system-ui, sans-serif; }
+  h1, h2, h3, .display { font-family: "Bricolage Grotesque", "Instrument Sans", system-ui, sans-serif; letter-spacing: -0.01em; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 28px 16px 72px; }
+
+  /* masthead */
+  .mast { background: var(--navy); color: #fff; }
+  .mast-in { max-width: 1160px; margin: 0 auto; padding: 30px 16px 24px; }
+  .mast .kicker { margin: 0 0 6px; color: #b9c8e6; font-size: .95rem; }
+  .mast h1 { margin: 0; font-size: clamp(2.1rem, 5.6vw, 3.5rem); line-height: 1.04; font-weight: 700; }
+  .mast .sub { margin: 10px 0 0; max-width: 60ch; color: #dbe5f8; font-size: 1.08rem; }
+  .track { height: 12px; background: repeating-linear-gradient(90deg, var(--amber) 0 22px, var(--navy) 22px 30px); }
+
+  /* explainer */
+  .how { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 0 0 22px; }
+  .how > div { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; }
+  .how h2 { font-size: 1.12rem; margin: 0 0 6px; color: var(--navy); }
+  .how p { margin: 0; color: var(--muted); font-size: .96rem; }
+  .how .legend { display: flex; gap: 14px; margin-top: 10px; flex-wrap: wrap; font-size: .9rem; color: var(--ink); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .dot.r { background: var(--loss); } .dot.g { background: var(--safe); } .dot.a { background: var(--amber-deep); }
+  .term { border-bottom: 1.5px dotted var(--rail); cursor: help; position: relative; text-decoration: none; color: inherit; }
+  .term:hover::after, .term:focus::after {
+    content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); width: 270px; z-index: 20;
+    background: var(--navy); color: #fff; padding: 9px 11px; border-radius: 6px; font-size: .86rem; line-height: 1.4; font-weight: 400; text-align: left;
+  }
+
+  details.cfg { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; margin-bottom: 22px; }
+  details.cfg summary { cursor: pointer; padding: 11px 16px; font-weight: 600; color: var(--navy); }
+  .cfg-body { padding: 0 16px 16px; display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+  .cfg-body label, .controls label { display: grid; gap: 4px; font-size: .9rem; color: var(--muted); }
+  input[type=text], input[type=number], .cfg-body input {
+    font: inherit; padding: 8px 10px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; color: var(--ink); min-width: 0;
+  }
+  .cfg-hint { grid-column: 1 / -1; margin: 0; font-size: .9rem; color: var(--muted); }
+
+  .banner { margin: 0 0 16px; padding: 10px 14px; border-radius: 6px; background: var(--loss-bg); color: var(--loss); border: 1px solid var(--loss); }
+  .banner[hidden] { display: none; }
+
+  /* scenario cards */
+  fieldset.scen { border: 0; margin: 0 0 16px; padding: 0; }
+  fieldset.scen legend { font-family: "Bricolage Grotesque", sans-serif; font-weight: 700; font-size: 1.25rem; padding: 0; margin-bottom: 10px; color: var(--navy); }
+  .controls label.pick, .pick { display: grid; gap: 4px; font-family: "Bricolage Grotesque", sans-serif; font-weight: 700; font-size: 1.05rem; color: var(--navy); }
+  .pick select { min-width: min(100%, 340px); font: 500 1rem "Instrument Sans", sans-serif; padding: 9px 12px; border: 2px solid var(--rule); border-radius: 8px; background: var(--card); color: var(--ink); }
+  .pick select:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .controls label.pick { font-size: 1.15rem; color: var(--navy); }
+  .story { margin: -8px 0 18px; color: var(--muted); }
+  .helper { margin: 16px 0 0; padding: 8px 12px; border: 1px dashed var(--rule); border-radius: 8px; color: var(--muted); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; }
+  .helper > span:first-child { font-weight: 600; color: var(--navy); }
+  .helper b { font-variant-numeric: tabular-nums; color: var(--ink); }
+  .helper em { font-style: normal; font-weight: 600; color: var(--wait); }
+  .helper em.go { color: var(--safe); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 10px; }
+  .card { position: relative; display: block; }
+  .card input { position: absolute; opacity: 0; inset: 0; cursor: pointer; }
+  .card .face { display: block; height: 100%; background: var(--card); border: 2px solid var(--rule); border-radius: 8px; padding: 11px 13px 12px; transition: border-color .15s, box-shadow .15s; }
+  .card .face b { display: block; font-size: .98rem; line-height: 1.25; color: var(--navy); }
+  .card .face span { display: block; margin-top: 4px; font-size: .86rem; color: var(--muted); line-height: 1.35; }
+  .card input:checked + .face { border-color: var(--amber); box-shadow: 0 0 0 3px rgba(245, 166, 35, .35); }
+  .card input:focus-visible + .face { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .card:hover .face { border-color: #9fb2d4; }
+  .card input:checked + .face:hover { border-color: var(--amber); }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 20px; }
+  button { font: inherit; font-weight: 600; padding: 10px 20px; border-radius: 6px; border: 2px solid var(--navy); background: var(--navy); color: #fff; cursor: pointer; }
+  button.primary { background: var(--amber); color: var(--navy); border-color: var(--amber); }
+  button.primary:hover:not(:disabled) { background: #ffb73f; }
+  button.ghost { background: transparent; color: var(--navy); }
+  button.small { padding: 6px 12px; font-size: .9rem; }
+  button:disabled { opacity: .55; cursor: progress; }
+
+  /* tour */
+  .tour { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; margin: 0 0 22px; }
+  .tour[hidden] { display: none; }
+  .tour h2 { margin: 0 0 4px; font-size: 1.25rem; color: var(--navy); }
+  .tour .bar { height: 8px; background: var(--soft); border-radius: 99px; overflow: hidden; margin: 8px 0 12px; }
+  .tour .bar i { display: block; height: 100%; background: var(--amber); width: 0; transition: width .3s; }
+  .tour .verdict-line { margin: 12px 0 0; font-weight: 600; color: var(--navy); }
+
+  /* pair of tickets */
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+  .ticket { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; position: relative; overflow: hidden; }
+  .ticket header { padding: 16px 18px 14px; border-bottom: 2px dashed var(--rule); position: relative; }
+  .ticket header::before, .ticket header::after { content: ""; position: absolute; bottom: -11px; width: 20px; height: 20px; border-radius: 50%; background: var(--paper); border: 1px solid var(--rule); }
+  .ticket header::before { left: -11px; } .ticket header::after { right: -11px; }
+  .ticket h2 { margin: 0; font-size: 1.4rem; color: var(--navy); }
+  .ticket.bad { border-top: 6px solid var(--loss); }
+  .ticket.good { border-top: 6px solid var(--safe); }
+  .sub2 { margin: 2px 0 0; color: var(--muted); font-size: .93rem; }
+  .pill { display: inline-block; margin-top: 10px; padding: 3px 11px; border-radius: 99px; font-weight: 600; font-size: .92rem; background: var(--soft); color: var(--muted); }
+  .pill.loss { background: var(--loss-bg); color: var(--loss); }
+  .pill.safe { background: var(--safe-bg); color: var(--safe); }
+  .pill.wait { background: var(--wait-bg); color: var(--wait); }
+  .body { padding: 8px 18px 20px; }
+  .body[hidden] { display: none; }
+  .empty { padding: 4px 18px 22px; color: var(--muted); margin: 0; }
+  .empty[hidden] { display: none; }
+
+  .hero { display: grid; grid-template-columns: auto 1fr; gap: 4px 22px; align-items: end; padding: 10px 0 6px; }
+  .hero .num { font-family: "Bricolage Grotesque", sans-serif; font-weight: 700; font-size: clamp(3.4rem, 8vw, 4.8rem); line-height: 1; font-variant-numeric: tabular-nums; }
+  .hero .num.loss { color: var(--loss); } .hero .num.safe { color: var(--safe); }
+  .hero .cap { color: var(--muted); font-size: .92rem; line-height: 1.35; }
+  .hero .cap b { color: var(--ink); display: block; font-size: 1rem; }
+  .hero .twice { grid-column: 1 / -1; font-size: .95rem; color: var(--muted); }
+  .hero .twice b { font-variant-numeric: tabular-nums; }
+  .hero .twice b.loss { color: var(--loss); }
+
+
+  .verdict { margin: 12px 0 4px; padding: 10px 13px; border-left: 5px solid var(--rule); background: var(--paper); border-radius: 0 6px 6px 0; font-size: .98rem; }
+  .verdict.bad { border-color: var(--loss); } .verdict.ok { border-color: var(--safe); } .verdict.wait { border-color: var(--amber-deep); }
+
+  h3.sec { font-size: 1.05rem; margin: 18px 0 6px; color: var(--navy); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .timeline { list-style: none; margin: 0; padding: 0; }
+  .timeline li { display: grid; grid-template-columns: 10px 1fr; gap: 10px; padding: 8px 0; border-top: 1px solid var(--soft); font-size: .94rem; animation: rise .35s ease-out; }
+  .timeline li::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--rule); margin-top: 7px; }
+  .timeline li.bad::before { background: var(--loss); } .timeline li.good::before { background: var(--safe); }
+  .timeline li.rec::before { background: var(--amber-deep); }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* flowchart */
+  .flows { margin-top: 28px; background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 20px 20px 22px; }
+  .flows[hidden] { display: none; }
+  .flows h2 { font-size: 1.5rem; margin: 0 0 4px; color: var(--navy); }
+  .flows h3 { margin: 0 0 6px; font-size: 1.05rem; color: var(--navy); }
+  .flowpair { display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 20px; margin-top: 14px; align-items: start; }
+  .flowbox { border: 1px solid var(--rule); border-radius: 8px; background: #f8faff; padding: 6px 4px 4px; overflow-x: auto; }
+  .flowbox svg { width: 100%; height: auto; display: block; min-width: 460px; }
+  .flow-note { margin: 6px 4px 2px; min-height: 2.9em; font-size: .9rem; color: var(--muted); }
+  .node { opacity: .42; transition: opacity .4s; cursor: pointer; }
+  .node.on { opacity: 1; }
+  .node rect { fill: #fff; stroke: #b7c3d8; stroke-width: 1.5; transition: fill .4s, stroke .4s; }
+  .node.ok rect { stroke: var(--safe); fill: var(--safe-bg); }
+  .node.bad rect { stroke: var(--loss); fill: var(--loss-bg); }
+  .node.wait rect { stroke: var(--amber-deep); fill: var(--wait-bg); }
+  .node:focus-visible rect { stroke: var(--focus); stroke-width: 3; }
+  .node text.t { font: 600 12.5px "Instrument Sans", sans-serif; fill: var(--ink); }
+  .node text.s { font: 10px "Instrument Sans", sans-serif; fill: var(--muted); }
+  .edge { fill: none; stroke: #b7c3d8; stroke-width: 1.5; stroke-dasharray: 4 4; marker-end: url(#m-off); transition: stroke .4s; }
+  .edge.on { stroke-dasharray: none; stroke-width: 2.6; }
+  .edge.ok { stroke: var(--safe); marker-end: url(#m-ok); }
+  .edge.bad { stroke: var(--loss); marker-end: url(#m-bad); }
+  .edge.wait { stroke: var(--amber-deep); marker-end: url(#m-wait); }
+  .elabel { font: 10.5px "Instrument Sans", sans-serif; fill: #6b7890; }
+  .elabel.on { fill: var(--ink); font-weight: 600; }
+  .nnote { font: italic 600 10.5px "Instrument Sans", sans-serif; fill: var(--loss); }
+
+  /* batch */
+  .batch { margin-top: 40px; background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 20px 20px 22px; }
+  .batch h2 { font-size: 1.5rem; margin: 0 0 4px; color: var(--navy); }
+  .note { color: var(--muted); font-size: .94rem; max-width: 75ch; margin: 4px 0; }
+  .progress { height: 8px; border-radius: 99px; background: var(--soft); overflow: hidden; margin: 12px 0 4px; position: relative; }
+  .progress i { position: absolute; top: 0; bottom: 0; width: 35%; background: var(--amber); border-radius: 99px; animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { 0% { left: -35%; } 100% { left: 100%; } }
+  .mix { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+  .mix span { background: var(--soft); border-radius: 99px; padding: 3px 11px; font-size: .88rem; color: var(--ink); }
+  .mix span b { font-variant-numeric: tabular-nums; }
+  table { border-collapse: collapse; width: 100%; background: #fff; border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+  th, td { padding: 10px 14px; text-align: right; border-top: 1px solid var(--soft); font-variant-numeric: tabular-nums; vertical-align: top; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { border-top: 0; background: var(--soft); color: var(--navy); }
+  td small { display: block; color: var(--muted); font-weight: 400; font-size: .84rem; max-width: 34ch; }
+  td.lossy { color: var(--loss); font-weight: 600; } td.okay { color: var(--safe); font-weight: 600; }
+  .bars { display: grid; gap: 14px; margin: 18px 0 8px; }
+  .bars h3 { margin: 0 0 6px; font-size: 1rem; color: var(--navy); }
+  .brow { display: grid; grid-template-columns: 9.5rem 1fr 3rem; gap: 10px; align-items: center; font-size: .92rem; margin: 3px 0; }
+  .brow .trk { background: var(--soft); border-radius: 4px; height: 18px; overflow: hidden; }
+  .brow .trk i { display: block; height: 100%; min-width: 3px; transition: width .6s; }
+  .brow .trk i.n { background: var(--loss); } .brow .trk i.s { background: var(--safe); }
+  .brow b { text-align: right; font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 900px) {
+    .pair, .how, .cfg-body, .flowpair { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .brow { grid-template-columns: 7.5rem 1fr 2.6rem; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="m-off" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b7c3d8"/></marker>
+    <marker id="m-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#187a4f"/></marker>
+    <marker id="m-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b3261e"/></marker>
+    <marker id="m-wait" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b87400"/></marker>
+  </defs>
+</svg>
+
+<header class="mast">
+  <div class="mast-in">
+    <p class="kicker">Cloud Architecture project · Tatkal case study</p>
+    <h1>Tatkal Booking Consistency</h1>
+    <p class="sub">Resilient payment–booking consistency for high-demand ticket booking on AWS. The AWS services here are real; the payment gateway and the money are simulated.</p>
+  </div>
+  <div class="track" aria-hidden="true"></div>
+</header>
+
+<main class="wrap">
+  <section class="how" aria-label="How to read this page">
+    <div>
+      <h2>The problem</h2>
+      <p>Buying a ticket needs two things to both happen: your money is taken, and a seat is booked. They happen in separate systems, so one can succeed while the other fails, and the customer is left paid with no ticket, or charged twice.</p>
+    </div>
+    <div>
+      <h2>Two systems, same failure</h2>
+      <p>On the left, the system charges first and books second, and nothing repairs a break. On the right, a <abbr class="term" tabindex="0" data-tip="A saga is a chain of steps where every step has an undo (refund, release the seat) that runs if a later step fails.">saga</abbr> holds the seat, pays once using an <abbr class="term" tabindex="0" data-tip="A unique id for the order. Sending the same id twice counts as one request, so a double click cannot charge twice.">idempotency key</abbr>, confirms, and repairs failures. A <abbr class="term" tabindex="0" data-tip="A checker that runs every minute, asks the bank what really happened to unclear payments, and then books the seat or refunds.">reconciler</abbr> and a <abbr class="term" tabindex="0" data-tip="A holding queue for cases the system could not fix itself, so that a person reviews them. An alarm fires while it is not empty.">dead-letter queue</abbr> catch the rest.</p>
+    </div>
+    <div>
+      <h2>How to read the results</h2>
+      <p>Pick a scenario and run it. Each side shows what happened to the customer, the steps in order, and the path through AWS that the order took.</p>
+      <div class="legend"><span><i class="dot r"></i>Customer harmed</span><span><i class="dot g"></i>Handled correctly</span><span><i class="dot a"></i>Waiting or needs a person</span></div>
+    </div>
+  </section>
+
+  <details class="cfg" id="cfg">
+    <summary>Connect to your AWS stack</summary>
+    <div class="cfg-body">
+      <label>Naive flow URL<input type="text" id="u-naive" placeholder="https://…lambda-url.ap-southeast-2.on.aws/" autocomplete="off"></label>
+      <label>Saga flow URL<input type="text" id="u-saga" placeholder="https://…lambda-url.ap-southeast-2.on.aws/" autocomplete="off"></label>
+      <label>Ledger URL<input type="text" id="u-ledger" placeholder="https://…lambda-url.ap-southeast-2.on.aws/" autocomplete="off"></label>
+      <label>Batch URL<input type="text" id="u-batch" placeholder="https://…lambda-url.ap-southeast-2.on.aws/" autocomplete="off"></label>
+      <p class="cfg-hint">Copy the four values from the Outputs tab of the tatkal-baseline stack (NaiveUrl, SagaUrl, LedgerUrl, BatchUrl). They are saved in this browser.</p>
+    </div>
+  </details>
+
+  <p class="banner" id="err" role="alert" hidden></p>
+
+  <div class="controls scen">
+    <label class="pick">Choose what goes wrong<select id="scen"></select></label>
+    <button class="primary" id="run">Run both systems</button>
+    <button id="tour">Play all 7 scenarios</button>
+  </div>
+  <p class="story" id="story"></p>
+
+  <section class="tour" id="tour-box" hidden aria-live="polite">
+    <h2>All seven scenarios</h2>
+    <p class="note" id="tour-status"></p>
+    <div class="bar"><i id="tour-bar"></i></div>
+    <div id="tour-out"></div>
+  </section>
+
+  <div class="pair">
+    <section class="ticket bad" aria-labelledby="h-naive">
+      <header>
+        <h2 id="h-naive">Without protection</h2>
+        <p class="sub2">Charge first, then book. Nothing repairs a failure in between.</p>
+        <span class="pill" id="pill-naive" role="status">Waiting for a run</span>
+      </header>
+      <p class="empty" id="empty-naive">Choose a scenario above and press Run both systems.</p>
+      <div class="body" id="body-naive" hidden>
+        <div class="hero" id="hero-naive"></div>
+        <p class="verdict" id="verdict-naive"></p>
+        <h3 class="sec">What happened, step by step <button class="ghost small" data-replay="naive">Replay</button></h3>
+        <ol class="timeline" id="tl-naive"></ol>
+      </div>
+    </section>
+    <section class="ticket good" aria-labelledby="h-saga">
+      <header>
+        <h2 id="h-saga">With our solution</h2>
+        <p class="sub2">Hold the seat, pay once, confirm. Refund or release if a step fails.</p>
+        <span class="pill" id="pill-saga" role="status">Waiting for a run</span>
+      </header>
+      <p class="empty" id="empty-saga">Choose a scenario above and press Run both systems.</p>
+      <div class="body" id="body-saga" hidden>
+        <div class="hero" id="hero-saga"></div>
+        <p class="verdict" id="verdict-saga"></p>
+        <h3 class="sec">What happened, step by step <button class="ghost small" data-replay="saga">Replay</button></h3>
+        <ol class="timeline" id="tl-saga"></ol>
+      </div>
+    </section>
+  </div>
+
+  <section class="flows" id="flows" hidden aria-labelledby="h-flows">
+    <h2 id="h-flows">What happened inside AWS</h2>
+    <p class="note">The boxes the order passed through are lit; the others are faded. Green went well, red failed, amber is waiting or needs a person. Click or tab to any box to read what it does.</p>
+    <div class="flowpair">
+      <div>
+        <h3>Without protection</h3>
+        <div class="flowbox"><svg id="flow-naive" viewBox="0 0 530 215" role="img" aria-label="Flowchart of the charge-first flow"></svg><p class="flow-note" id="fn-naive">Click or tab to a box to see what it does.</p></div>
+      </div>
+      <div>
+        <h3>With our solution</h3>
+        <div class="flowbox"><svg id="flow-saga" viewBox="0 0 710 300" role="img" aria-label="Flowchart of the saga flow"></svg><p class="flow-note" id="fn-saga">AWS Step Functions runs these steps in order. Each box is a Lambda function and the seat and payment records live in DynamoDB.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="batch" aria-labelledby="h-batch">
+    <h2 id="h-batch">Many bookings at once</h2>
+    <p class="note">Sends the same random mix of successes and failures through both systems and compares the totals. It takes about two minutes and clears the previous data first.</p>
+    <div class="controls" style="margin-top:14px">
+      <label>Bookings<input type="number" id="b-n" value="200" min="10" max="300"></label>
+      <label>Share that hit a failure (%)<input type="number" id="b-pct" value="30" min="0" max="100"></label>
+      <button id="batch">Run batch</button>
+      <button id="refresh" class="ghost" hidden>Refresh totals</button>
+    </div>
+    <div id="batch-out"></div>
+    <p class="helper" id="helper" hidden aria-live="off">
+      <span>Presenter note</span>
+      <b id="h-time">0:00</b> since the latest results
+      <em id="h-cue"></em>
+      <span class="sep">Refreshes pressed: <b id="h-count">0</b></span>
+    </p>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const REDUCE = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const MODES = [
+  { id: "SUCCESS", title: "Everything works", story: "The control case. Both systems should issue a ticket." },
+  { id: "DECLINE", title: "The bank says no", story: "The card is declined. Nobody should be charged." },
+  { id: "TIMEOUT_BUT_CHARGED", title: "The bank takes the money but never replies", story: "The hardest case: nobody can tell whether the customer was charged." },
+  { id: "BOOKING_FAILS_AFTER_PAY", title: "Payment works, then booking fails", story: "The ticket system crashes right after the customer pays." },
+  { id: "DUPLICATE_CLICK", title: "The customer double-clicks Pay", story: "An impatient customer presses twice. Do they pay twice?" },
+  { id: "HOLD_EXPIRES_DURING_PAYMENT", title: "The seat hold runs out while paying", story: "Payment is slow and someone else gets the seat first." },
+  { id: "BOOKING_AND_REFUND_FAIL", title: "Booking fails, and so does the refund", story: "Everything breaks at once. What happens to the customer?" }
+];
+let selected = MODES[0].id;
+$("#scen").innerHTML = MODES.map((m) => `<option value="${m.id}">${m.title}</option>`).join("");
+const showStory = () => { $("#story").textContent = MODES.find((m) => m.id === selected).story; };
+$("#scen").addEventListener("change", (e) => { selected = e.target.value; showStory(); });
+function selectMode(id) { selected = id; $("#scen").value = id; showStory(); }
+showStory();
+
+// ---- configuration: query string first, then this browser's saved values
+const FIELDS = ["naive", "saga", "ledger", "batch"];
+const qs = new URLSearchParams(location.search);
+for (const f of FIELDS) {
+  let v = qs.get(f) || "";
+  try { v = v || localStorage.getItem("tatkal-" + f) || ""; } catch (e) {}
+  $("#u-" + f).value = v;
+  $("#u-" + f).addEventListener("change", () => { try { localStorage.setItem("tatkal-" + f, $("#u-" + f).value.trim()); } catch (e) {} });
+}
+if (FIELDS.some((f) => !$("#u-" + f).value)) $("#cfg").open = true;
+const cfg = (f) => $("#u-" + f).value.trim();
+function showError(msg) { const e = $("#err"); e.textContent = msg; e.hidden = !msg; }
+
+async function api(field, params) {
+  const base = cfg(field);
+  if (!base) throw new Error("The " + field + " URL is missing. Open “Connect to your AWS stack” and paste it.");
+  const u = new URL(base);
+  for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, v);
+  let r;
+  try { r = await fetch(u); } catch (e) { throw new Error("Could not reach the " + field + " URL. Check it is copied in full and the stack update has finished."); }
+  if (!r.ok) throw new Error("The " + field + " URL answered with status " + r.status + ".");
+  return r.json();
+}
+
+const rand = () => Math.random().toString(16).slice(2, 10);
+const rupees = (n) => "₹" + Number(n || 0).toLocaleString("en-IN");
+const sentence = (s) => { s = String(s || "").toLowerCase().replace(/_/g, " "); return s.charAt(0).toUpperCase() + s.slice(1); };
+const clean = (s) => String(s || "").replace(/[<>&]/g, "");
+const ZERO = { debitedRupees: 0, ticketsIssued: 0, orphanedPayments: 0, duplicateCharges: 0, pendingReconcile: 0 };
+const diff = (a, b) => Object.fromEntries(Object.keys(ZERO).map((k) => [k, (a[k] || 0) - (b[k] || 0)]));
+
+/* ================= flowcharts ================= */
+const BW = 120, BH = 54;
+const FLOWS = {
+  naive: {
+    nodes: {
+      charge: { x: 75, y: 50, t: "Charge the card", s: "Lambda + mock bank", tip: "Takes the money first. Every attempt gets a brand-new payment id, so a double click charges twice." },
+      book: { x: 265, y: 50, t: "Book the seat", s: "Lambda + DynamoDB", tip: "Tries to book the seat after the money is already taken. If this fails, nothing undoes the charge." },
+      ticket: { x: 455, y: 50, t: "Ticket issued", s: "Booking saved", tip: "The customer has a ticket and was charged once." },
+      told: { x: 75, y: 160, t: "Told: payment failed", s: "even if money was taken", tip: "The customer sees “payment failed”. If the bank actually took the money but its reply was lost, the customer is charged and does not know." },
+      lost: { x: 265, y: 160, t: "Paid, no ticket", s: "no refund, no retry", tip: "The money is taken, the seat is not booked, and nothing refunds or retries. The customer must notice and complain." }
+    },
+    edges: [
+      { k: "charge>book", pts: [[135, 50], [205, 50]], l: "charged", lx: 170, ly: 41, a: "middle" },
+      { k: "book>ticket", pts: [[325, 50], [395, 50]], l: "booked", lx: 360, ly: 41, a: "middle" },
+      { k: "charge>told", pts: [[75, 77], [75, 133]], l: "declined or no reply", lx: 83, ly: 108, a: "start" },
+      { k: "book>lost", pts: [[265, 77], [265, 133]], l: "booking fails", lx: 273, ly: 108, a: "start" }
+    ]
+  },
+  saga: {
+    nodes: {
+      reserve: { x: 75, y: 150, t: "1 Reserve seat", s: "Lambda + DynamoDB", tip: "Holds the seat for 120 seconds before any money moves. A conditional write in DynamoDB succeeds only if the seat is free, so two people cannot hold the same seat. A repeated click with the same order id is recognised and ignored." },
+      pay: { x: 265, y: 150, t: "2 Take payment", s: "Lambda + mock bank", tip: "Charges the customer once. The payment id comes from the order id, so retries and double clicks cannot charge twice." },
+      confirm: { x: 455, y: 150, t: "3 Confirm booking", s: "Lambda + DynamoDB", tip: "Turns the hold into a booking. If this fails, or the hold already expired, the saga moves to the refund step." },
+      ticket: { x: 645, y: 150, t: "Ticket issued", s: "Booking saved", tip: "The customer has a booked seat and was charged once." },
+      declined: { x: 265, y: 40, t: "Declined", s: "seat released", tip: "The bank said no. The held seat is released and nothing was charged." },
+      stop: { x: 75, y: 260, t: "Stop, no charge", s: "duplicate or taken", tip: "A duplicate click, or the seat was already taken: the system stops before charging anybody." },
+      recheck: { x: 265, y: 260, t: "Recheck later", s: "EventBridge + Lambda", tip: "When the bank never replies we cannot tell if the money was taken. The order is parked. An EventBridge schedule runs a Lambda every minute that asks the bank what happened, then books the seat or refunds the money." },
+      refund: { x: 455, y: 260, t: "Refund + release", s: "Lambda, automatic", tip: "Automatically returns the money and releases the seat. Retries twice if the refund call fails." },
+      review: { x: 645, y: 260, t: "Human review", s: "SQS queue + alarm", tip: "If even the refund fails, the order goes to an SQS dead-letter queue and a CloudWatch alarm fires, so a person finishes the job." }
+    },
+    edges: [
+      { k: "reserve>pay", pts: [[135, 150], [205, 150]], l: "seat held", lx: 170, ly: 141, a: "middle" },
+      { k: "pay>confirm", pts: [[325, 150], [395, 150]], l: "paid", lx: 360, ly: 141, a: "middle" },
+      { k: "confirm>ticket", pts: [[515, 150], [585, 150]], l: "booked", lx: 550, ly: 141, a: "middle" },
+      { k: "reserve>stop", pts: [[75, 177], [75, 233]], l: "duplicate or taken", lx: 83, ly: 208, a: "start" },
+      { k: "pay>declined", pts: [[265, 123], [265, 67]], l: "declined", lx: 273, ly: 98, a: "start" },
+      { k: "pay>recheck", pts: [[265, 177], [265, 233]], l: "no reply", lx: 273, ly: 208, a: "start" },
+      { k: "confirm>refund", pts: [[455, 177], [455, 233]], l: "booking failed", lx: 447, ly: 196, a: "end" },
+      { k: "refund>review", pts: [[515, 260], [585, 260]], l: "refund fails", lx: 550, ly: 251, a: "middle" },
+      { k: "recheck>refund", pts: [[325, 260], [395, 260]], l: "seat gone", lx: 360, ly: 279, a: "middle" },
+      { k: "recheck>ticket", pts: [[325, 247], [620, 179]], l: "bank says paid", lx: 520, ly: 188, a: "middle" }
+    ]
+  }
+};
+const SVGNS = "http://www.w3.org/2000/svg";
+function mk(tag, attrs, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;
+  return e;
+}
+function initFlow(side) {
+  const svg = $("#flow-" + side), def = FLOWS[side];
+  svg.innerHTML = "";
+  for (const e of def.edges) {
+    const p = mk("path", { class: "edge", "data-k": e.k, d: "M" + e.pts.map((q) => q.join(" ")).join(" L") });
+    svg.appendChild(p);
+    svg.appendChild(mk("text", { class: "elabel", "data-lk": e.k, x: e.lx, y: e.ly, "text-anchor": e.a }, e.l));
+  }
+  for (const [id, n] of Object.entries(def.nodes)) {
+    const g = mk("g", { class: "node", "data-id": id, tabindex: 0, role: "button", "aria-label": n.t + ". " + n.tip });
+    g.appendChild(mk("rect", { x: n.x - BW / 2, y: n.y - BH / 2, width: BW, height: BH, rx: 9 }));
+    g.appendChild(mk("text", { class: "t", x: n.x, y: n.y - 3, "text-anchor": "middle" }, n.t));
+    g.appendChild(mk("text", { class: "s", x: n.x, y: n.y + 13, "text-anchor": "middle" }, n.s));
+    g.appendChild(mk("text", { class: "nnote", "data-nn": id, x: n.x, y: n.y - BH / 2 - 6, "text-anchor": "middle" }, ""));
+    const say = () => { $("#fn-" + side).textContent = n.t + ": " + n.tip; };
+    g.addEventListener("click", say); g.addEventListener("focus", say);
+    g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); say(); } });
+    svg.appendChild(g);
+  }
+}
+function updateFlow(side, an) {
+  const svg = $("#flow-" + side);
+  const onNodes = new Set(an.path);
+  svg.querySelectorAll(".node").forEach((g) => {
+    const id = g.dataset.id, st = an.state[id];
+    g.setAttribute("class", "node" + (onNodes.has(id) ? " on" : "") + (st ? " " + st : ""));
+    g.querySelector(".nnote").textContent = an.notes[id] || "";
+  });
+  const used = {};
+  for (let i = 0; i < an.path.length - 1; i++) used[an.path[i] + ">" + an.path[i + 1]] = an.state[an.path[i + 1]] || "ok";
+  svg.querySelectorAll(".edge").forEach((p) => {
+    const st = used[p.dataset.k];
+    p.setAttribute("class", "edge" + (st ? " on " + st : ""));
+  });
+  svg.querySelectorAll(".elabel").forEach((t) => t.setAttribute("class", "elabel" + (used[t.dataset.lk] ? " on" : "")));
+}
+
+// Turn the recorded events into "which boxes did this order pass through, and how did each go".
+function sagaPath(rows) {
+  const path = [], state = {}, notes = {};
+  const push = (id, st) => { if (!path.includes(id)) path.push(id); if (st) state[id] = st; };
+  for (const r of rows) {
+    const s = r.step, m = r.message || "";
+    if (r.flow === "RECONCILER") {
+      if (s === "RETRY") { push("recheck", "bad"); continue; }
+      push("reserve"); push("pay"); push("recheck", "ok");
+      if (s === "CONFIRMED") push("ticket", "ok");
+      else if (s === "REFUNDED") push("refund", "ok");
+      continue;
+    }
+    switch (s) {
+      case "RESERVED": push("reserve", "ok"); break;
+      case "DUPLICATE_IGNORED": push("reserve", "ok"); notes.reserve = "2nd click ignored"; break;
+      case "SEAT_TAKEN": push("reserve", "bad"); push("stop", "ok"); break;
+      case "HOLD_EXPIRED": state.reserve = "bad"; notes.reserve = "hold ran out"; push("reserve"); push("pay"); break;
+      case "PAY": push("reserve"); push("pay", /DECLINED/.test(m) ? "bad" : /TIMEOUT/.test(m) ? "wait" : "ok"); if (/DECLINED/.test(m)) push("declined", "ok"); break;
+      case "PENDING": push("pay", "wait"); push("recheck", "wait"); break;
+      case "CONFIRM_FAILED": push("pay"); push("confirm", "bad"); break;
+      case "BOOKED": push("confirm", "ok"); push("ticket", "ok"); break;
+      case "REFUND_FAILED": push("refund", "bad"); push("review", "wait"); break;
+      case "REFUNDED": push("refund", "ok"); break;
+    }
+  }
+  return { path, state, notes };
+}
+function naivePath(rows, money) {
+  const path = [], state = {}, notes = {};
+  const push = (id, st) => { if (!path.includes(id)) path.push(id); if (st) state[id] = st; };
+  let charges = 0;
+  for (const r of rows) {
+    const m = r.message || "";
+    if (r.step === "CHARGE") { charges++; push("charge", /SUCCESS/.test(m) ? "ok" : "wait"); if (charges > 1) notes.charge = "charged twice"; }
+    else if (r.step === "END") push("told", money == null ? "wait" : money > 0 ? "bad" : "ok");
+    else if (r.step === "BOOKED") { push("charge", "ok"); push("book", "ok"); push("ticket", "ok"); }
+    else if (r.step === "BOOK_FAILED") { push("book", "bad"); push("lost", "bad"); }
+  }
+  return { path, state, notes };
+}
+const analyse = (side, rows, money) => side === "naive" ? naivePath(rows, money) : sagaPath(rows);
+
+/* ================= rendering ================= */
+const view = { naive: { rows: [], ctx: null }, saga: { rows: [], ctx: null } };
+
+function setPill(side, text, kind) { const p = $("#pill-" + side); p.textContent = text; p.className = "pill " + (kind || ""); }
+function pillFor(side, outcome, d, mode) {
+  if (side === "naive") {
+    if (d.duplicateCharges > 0) return ["Charged twice for one seat", "loss"];
+    if (d.orphanedPayments > 0) return ["Paid, no ticket", "loss"];
+    if (outcome === "BOOKED") return ["Ticket issued", "safe"];
+    return ["Nothing charged", ""];
+  }
+  const map = { BOOKED: ["Ticket issued", "safe"], REFUNDED: ["Booking failed, refunded automatically", "safe"],
+    DECLINED: ["Declined, nothing charged", ""], PENDING_RECONCILE: ["Checking with the bank", "wait"],
+    DUPLICATE: ["Duplicate click ignored", "safe"], SEAT_TAKEN: ["Seat taken, nothing charged", ""],
+    NeedsManualReview: ["Sent to the review queue", "wait"] };
+  return map[outcome] || [sentence(outcome), ""];
+}
+
+function renderHero(side, d, pending) {
+  const lossy = d.orphanedPayments > 0;
+  const kind = pending ? "wait" : lossy ? "loss" : "safe";
+  $("#hero-" + side).innerHTML = `
+    <div class="num ${lossy ? (pending ? "" : "loss") : "safe"}" ${pending ? 'style="color:var(--wait)"' : ""}>${d.orphanedPayments}</div>
+    <div class="cap"><b>Paid, no ticket</b>${pending ? "being checked by the reconciler" : lossy ? "customer charged with nothing to show for it" : "nobody left out of pocket"}</div>
+    <div class="twice">Charged twice for one seat: <b class="${d.duplicateCharges > 0 ? "loss" : ""}">${d.duplicateCharges}</b></div>`;
+}
+
+function verdictFor(side, mode, outcome, d, afterRecheck) {
+  const ticket = d.ticketsIssued > 0, money = d.debitedRupees;
+  if (side === "naive") {
+    if (d.duplicateCharges > 0) return ["bad", "The customer clicked twice and was charged ₹1,000 for one seat. The second payment was never noticed or reversed."];
+    if (mode === "TIMEOUT_BUT_CHARGED") return ["bad", "The bank took the money but its reply was lost. The customer was told the payment failed, so they will try again. They have paid ₹500 and have no ticket."];
+    if (d.orphanedPayments > 0) return ["bad", "The customer paid ₹500, then the booking failed. Nothing refunds the money and nothing retries. They are charged with no ticket until they complain."];
+    if (outcome === "BOOKED") return ["ok", "Both steps worked: ₹500 charged, ticket issued."];
+    return ["ok", "The bank said no, so nothing was charged and nobody lost anything."];
+  }
+  if (afterRecheck && outcome === "BOOKED") return ["ok", "The recheck found that the payment had gone through, so the seat was booked after the fact. The customer was charged once and has a ticket."];
+  switch (outcome) {
+    case "BOOKED": return ["ok", mode === "DUPLICATE_CLICK" ? "The second click carried the same order id, so it was recognised and ignored. The customer was charged ₹500 once and has a ticket." : "The seat was held first, the customer was charged once, and the booking was confirmed."];
+    case "DECLINED": return ["ok", "The bank said no. The held seat was released and nothing was charged."];
+    case "REFUNDED": return ["ok", "The booking failed after payment, so the system refunded ₹500 automatically and released the seat. The customer is whole again."];
+    case "PENDING_RECONCILE": return ["wait", "The bank never replied, so nobody knows if the money was taken. The order is parked and a checker asks the bank every minute, then books the seat or refunds. Watch this box change."];
+    case "NeedsManualReview": return ["wait", "The booking failed and the refund failed too. The case went to the review queue and an alarm fires. The ₹500 is not lost, but a person has to finish the job."];
+    case "SEAT_TAKEN": return ["ok", "Someone else already held that seat, so the system stopped before charging anyone."];
+    default: return ["ok", "Order finished."];
+  }
+}
+
+const replayToken = { naive: 0, saga: 0 };
+function renderRow(r) {
+  const bad = /FAILED|TAKEN|EXPIRED|RETRY/.test(r.step);
+  const good = /BOOKED|REFUNDED|RESERVED|RELEASED|CONFIRMED|DUPLICATE_IGNORED/.test(r.step);
+  const rec = r.flow === "RECONCILER";
+  return `<li class="${bad ? "bad" : rec ? "rec" : good ? "good" : ""}"><span><b>${rec ? "Recheck: " : ""}${sentence(r.step)}.</b> ${clean(r.message)}</span></li>`;
+}
+async function replay(side, rows, speed, money) {
+  const tok = ++replayToken[side];
+  const ol = $("#tl-" + side);
+  ol.innerHTML = "";
+  updateFlow(side, analyse(side, [], null));
+  for (let i = 0; i < rows.length; i++) {
+    if (tok !== replayToken[side]) return;
+    ol.insertAdjacentHTML("beforeend", renderRow(rows[i]));
+    updateFlow(side, analyse(side, rows.slice(0, i + 1), i === rows.length - 1 ? money : null));
+    if (speed && i < rows.length - 1) await sleep(speed);
+  }
+}
+function showAll(side, rows, money) {
+  $("#tl-" + side).innerHTML = rows.map(renderRow).join("");
+  updateFlow(side, analyse(side, rows, money));
+}
+function prepare(side) {
+  $("#flows").hidden = false;
+  $("#empty-" + side).hidden = true; $("#body-" + side).hidden = false;
+  $("#tl-" + side).innerHTML = ""; $("#verdict-" + side).textContent = ""; $("#verdict-" + side).className = "verdict";
+  renderHero(side, ZERO, false);
+  updateFlow(side, { path: [], state: {}, notes: {} });
+  setPill(side, "Running…");
+}
+function finalize(side, ctx) {
+  const { mode, outcome, d, rows, afterRecheck } = ctx;
+  const pending = outcome === "PENDING_RECONCILE" && !afterRecheck;
+  renderHero(side, d, pending);
+  const [kind, text] = verdictFor(side, mode, outcome, d, afterRecheck);
+  const v = $("#verdict-" + side); v.textContent = text; v.className = "verdict " + kind;
+  if (afterRecheck) setPill(side, afterRecheck, "safe"); else setPill(side, ...pillFor(side, outcome, d, mode));
+  view[side].ctx = ctx;
+}
+
+let busy = false;
+function setBusy(b) { busy = b; for (const id of ["#run", "#tour", "#batch", "#refresh"]) $(id).disabled = b; }
+
+async function runBoth(opts = {}) {
+  const mode = selected, id = rand(), nid = "txn-" + id, sid = "sg-" + id, seat = "U" + id;
+  prepare("naive"); prepare("saga");
+  const speed = REDUCE ? 0 : opts.fast ? 160 : 650;
+  const [n0, s0] = await Promise.all([api("ledger", { flow: "NAIVE" }), api("ledger", { flow: "SAGA" })]);
+  const [nr, sr] = await Promise.all([
+    api("naive", { mode, txnId: nid, eventId: "NAIVE-LIVE", seatId: seat }),
+    api("saga", { mode, key: sid, eventId: "SAGA-LIVE", seatId: seat })
+  ]);
+  const [nrows, srows] = await Promise.all([api("ledger", { events: nid }), api("ledger", { events: sid })]);
+  const [n1, s1] = await Promise.all([api("ledger", { flow: "NAIVE" }), api("ledger", { flow: "SAGA" })]);
+  const nd = diff(n1, n0), sd = diff(s1, s0);
+  view.naive.rows = nrows; view.saga.rows = srows;
+  await Promise.all([replay("naive", nrows, speed, nd.debitedRupees), replay("saga", srows, speed, sd.debitedRupees)]);
+  finalize("naive", { mode, outcome: nr.outcome, d: nd, rows: nrows });
+  finalize("saga", { mode, outcome: sr.outcome, d: sd, rows: srows });
+  return { mode, nr, sr, nd, sd, sid, s0 };
+}
+
+async function onRun() {
+  if (busy) return;
+  setBusy(true); showError("");
+  try {
+    const res = await runBoth();
+    if (res.sr.outcome === "PENDING_RECONCILE") await watchReconciler(res.sid, res.s0, res.mode);
+  } catch (e) { showError(e.message); setPill("naive", "Run failed"); setPill("saga", "Run failed"); }
+  finally { setBusy(false); }
+}
+
+// The reconciler runs once a minute. Poll until it has resolved the parked payment.
+async function watchReconciler(sid, before, mode) {
+  for (let i = 0; i < 30; i++) {
+    await sleep(5000);
+    const rows = await api("ledger", { events: sid });
+    const done = rows.find((r) => r.flow === "RECONCILER" && r.step !== "RETRY");
+    if (done) {
+      const s1 = await api("ledger", { flow: "SAGA" });
+      const sd = diff(s1, before);
+      view.saga.rows = rows;
+      showAll("saga", rows, sd.debitedRupees);
+      const ok = /CONFIRMED/.test(done.step);
+      finalize("saga", { mode, outcome: ok ? "BOOKED" : "REFUNDED", d: sd, rows, afterRecheck: ok ? "Ticket issued after a recheck" : "Resolved by the reconciler" });
+      return true;
+    }
+    showAll("saga", rows, null);
+  }
+  return false;
+}
+
+/* ================= tour ================= */
+const SHORT = { BOOKED: "Ticket issued", REFUNDED: "Refunded automatically", DECLINED: "Declined, nothing charged", PENDING_RECONCILE: "Checking with the bank…",
+  DUPLICATE: "Duplicate ignored", SEAT_TAKEN: "Seat taken, nothing charged", NeedsManualReview: "Sent to a person" };
+async function onTour() {
+  if (busy) return;
+  setBusy(true); showError("");
+  const box = $("#tour-box"); box.hidden = false;
+  const out = [];
+  const draw = () => {
+    $("#tour-out").innerHTML = `<table><thead><tr><th>Scenario</th><th>Without protection</th><th>With our solution</th></tr></thead><tbody>` +
+      out.map((r) => `<tr><td>${MODES.find((m) => m.id === r.mode).title}</td><td class="${r.nHarm ? "lossy" : ""}">${r.nText}</td><td class="${r.sKind === "ok" ? "okay" : r.sKind === "wait" ? "" : ""}" ${r.sKind === "wait" ? 'style="color:var(--wait);font-weight:600"' : ""}>${r.sText}</td></tr>`).join("") +
+      `</tbody></table>`;
+  };
+  try {
+    for (let i = 0; i < MODES.length; i++) {
+      selectMode(MODES[i].id);
+      $("#tour-status").textContent = `Running scenario ${i + 1} of ${MODES.length}: ${MODES[i].title}`;
+      $("#tour-bar").style.width = (i / MODES.length * 100) + "%";
+      const r = await runBoth({ fast: true });
+      const nHarm = r.nd.orphanedPayments > 0 || r.nd.duplicateCharges > 0;
+      const nText = r.nd.duplicateCharges > 0 ? "Charged twice" : r.nd.orphanedPayments > 0 ? "Paid, no ticket" : r.nr.outcome === "BOOKED" ? "Ticket issued" : "Nothing charged";
+      const sOut = r.sr.outcome;
+      out.push({ mode: MODES[i].id, nHarm, nText, sText: SHORT[sOut] || sentence(sOut), sKind: sOut === "NeedsManualReview" || sOut === "PENDING_RECONCILE" ? "wait" : "ok", sid: r.sid, s0: r.s0, pending: sOut === "PENDING_RECONCILE" });
+      draw();
+    }
+    $("#tour-bar").style.width = "100%";
+    // wait for the one-minute reconciler to settle any parked payment
+    const parked = out.filter((r) => r.pending);
+    if (parked.length) {
+      $("#tour-status").textContent = "Waiting for the reconciler to settle the payment that got no reply…";
+      for (let t = 0; t < 30 && parked.some((r) => r.pending); t++) {
+        await sleep(5000);
+        for (const r of parked.filter((p) => p.pending)) {
+          const rows = await api("ledger", { events: r.sid });
+          const done = rows.find((x) => x.flow === "RECONCILER" && x.step !== "RETRY");
+          if (done) { r.pending = false; r.sText = /CONFIRMED/.test(done.step) ? "Ticket issued after a recheck" : "Refunded by the recheck"; r.sKind = "ok"; draw(); }
+        }
+      }
+    }
+    const nBad = out.filter((r) => r.nHarm).length, sPerson = out.filter((r) => r.sKind === "wait" && !r.pending).length + out.filter((r) => r.pending).length;
+    $("#tour-status").textContent = "Done.";
+    $("#tour-out").insertAdjacentHTML("beforeend", `<p class="verdict-line">Without protection, the customer was harmed in ${nBad} of ${MODES.length} scenarios. With our solution, no customer was left harmed and ${sPerson} case${sPerson === 1 ? " needed" : "s needed"} a person.</p>`);
+  } catch (e) { showError(e.message); $("#tour-status").textContent = "Stopped: " + e.message; }
+  finally { setBusy(false); }
+}
+
+/* ================= batch ================= */
+const MIX = { SUCCESS: "worked", DECLINE: "bank declined", TIMEOUT_BUT_CHARGED: "bank never replied", BOOKING_FAILS_AFTER_PAY: "booking failed after payment", DUPLICATE_CLICK: "double-clicked", HOLD_EXPIRES_DURING_PAYMENT: "seat hold ran out" };
+const ROWS = [
+  ["Money taken", "Total charged to customers, after refunds.", (d) => rupees(d.debitedRupees), null],
+  ["Tickets issued", "Customers who ended up with a seat.", (d) => d.ticketsIssued, null],
+  ["Paid, no ticket", "Charged, but no seat booked and no refund.", (d) => d.orphanedPayments, "orphanedPayments"],
+  ["Charged twice", "Extra payments for the same seat.", (d) => d.duplicateCharges, "duplicateCharges"],
+  ["Still being checked", "Payments the reconciler has not settled yet.", (d) => d.pendingReconcile, null]
+];
+const REFRESH_AFTER = 120; // seconds: unclear payments are mostly settled by then
+let helperStart = 0, helperTimer = null, refreshCount = 0;
+function helperTick() {
+  const t = Math.floor((Date.now() - helperStart) / 1000);
+  $("#h-time").textContent = Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
+  const cue = $("#h-cue"), left = REFRESH_AFTER - t;
+  cue.className = left <= 0 ? "go" : "";
+  cue.textContent = left <= 0 ? "Press Refresh totals now" : "Press Refresh totals in " + left + " s";
+}
+function helperStartTimer(reset) {
+  if (reset) refreshCount = 0;
+  $("#h-count").textContent = refreshCount;
+  $("#helper").hidden = false;
+  helperStart = Date.now();
+  clearInterval(helperTimer);
+  helperTimer = setInterval(helperTick, 500);
+  helperTick();
+}
+let batchMeta = { title: "Totals", mix: null };
+function barRows(label, key, n, s) {
+  const mx = Math.max(n[key] || 0, s[key] || 0, 1);
+  const w = (v) => Math.max(0, (v || 0) / mx * 100);
+  return `<div><h3>${label}</h3>
+    <div class="brow"><span>Without protection</span><span class="trk"><i class="n" style="width:${w(n[key])}%"></i></span><b>${n[key] || 0}</b></div>
+    <div class="brow"><span>With our solution</span><span class="trk"><i class="s" style="width:${w(s[key])}%"></i></span><b>${s[key] || 0}</b></div></div>`;
+}
+const MODE_TEXT = { SCAN: "one reconciler sweeps every minute", BACKOFF: "each unclear payment has its own recheck timer (2, 4, 8, 16, 32, 64 seconds)" };
+function renderBatch(n, s) {
+  const secs = (v) => v == null ? "-" : v + " s";
+  const extra = s.avgResolveSecs == null ? [] : [
+    ["Average time to settle", "From “bank never replied” to a ticket or refund.", () => "-", (d) => secs(d.avgResolveSecs)],
+    ["Slowest to settle", "The longest any customer waited for the answer.", () => "-", (d) => secs(d.maxResolveSecs)],
+    ["Questions asked to the bank", "Status checks the system sent to find the truth.", () => "-", (d) => d.bankStatusCalls ?? "-"]];
+  const mode = s.reconcilerMode ? `<p class="note">Follow-up method in this run: <b>${s.reconcilerMode === "BACKOFF" ? "recheck timers" : "scheduled sweep"}</b> - ${MODE_TEXT[s.reconcilerMode] || ""}.</p>` : "";
+  const cls = (key, d, side) => key ? (d[key] > 0 ? "lossy" : side === "saga" ? "okay" : "") : "";
+  const mix = batchMeta.mix ? `<div class="mix" aria-label="What was in the mix">${Object.entries(batchMeta.mix).map(([k, v]) => `<span><b>${v}</b> ${MIX[k] || sentence(k)}</span>`).join("")}</div>` : "";
+  $("#batch-out").innerHTML = `
+    <p class="note"><b>${clean(batchMeta.title)}.</b> Both systems received exactly the same bookings.</p>${mix}
+    <table><thead><tr><th>What was counted</th><th>Without protection</th><th>With our solution</th></tr></thead><tbody>
+    ${ROWS.map(([label, hint, f, key]) => `<tr><td>${label}<small>${hint}</small></td><td class="${cls(key, n, "naive")}">${f(n)}</td><td class="${cls(key, s, "saga")}">${f(s)}</td></tr>`).join("")}
+    ${extra.map(([label, hint, fn, fs]) => `<tr><td>${label}<small>${hint}</small></td><td>${fn(n)}</td><td>${fs(s)}</td></tr>`).join("")}
+    </tbody></table>${mode}
+    <div class="bars">${barRows("Paid, no ticket", "orphanedPayments", n, s)}${barRows("Charged twice", "duplicateCharges", n, s)}</div>
+    <p class="note">${s.pendingReconcile ? "Some payments in the right column had no answer from the bank. The system keeps asking the bank for the truth. Press Refresh totals in about a minute and “Paid, no ticket” should drop to 0." : "Every payment in the right column is settled: a ticket or a refund."}</p>`;
+  $("#refresh").hidden = false;
+}
+async function onBatch() {
+  if (busy) return;
+  setBusy(true); showError("");
+  const t0 = Date.now();
+  const timer = setInterval(() => { const el = $("#bt"); if (el) el.textContent = Math.round((Date.now() - t0) / 1000); }, 500);
+  $("#batch-out").innerHTML = `<div class="progress"><i></i></div><p class="note">Running both systems on the same bookings, <span id="bt">0</span> seconds so far. This takes about two minutes. Please keep this page open.</p>`;
+  try {
+    const n = Math.max(10, Math.min(300, +$("#b-n").value || 200)), pct = Math.max(0, Math.min(100, +$("#b-pct").value || 0));
+    const r = await api("batch", { n, failPct: pct });
+    batchMeta = { title: n + " bookings, " + pct + "% hit a failure", mix: r.scenarios || null };
+    renderBatch(r.naive, r.saga);
+    helperStartTimer(true);
+  } catch (e) { showError(e.message); $("#batch-out").innerHTML = ""; }
+  finally { clearInterval(timer); setBusy(false); }
+}
+async function onRefresh() {
+  setBusy(true);
+  try {
+    const [n, s] = await Promise.all([api("ledger", { flow: "NAIVE" }), api("ledger", { flow: "SAGA" })]);
+    renderBatch(n, s);
+    refreshCount++; helperStartTimer(false);
+  } catch (e) { showError(e.message); }
+  finally { setBusy(false); }
+}
+
+/* ================= wire up ================= */
+$("#run").addEventListener("click", onRun);
+$("#tour").addEventListener("click", onTour);
+$("#batch").addEventListener("click", onBatch);
+$("#refresh").addEventListener("click", onRefresh);
+document.querySelectorAll("[data-replay]").forEach((b) => b.addEventListener("click", async () => {
+  const side = b.dataset.replay, rows = view[side].rows, ctx = view[side].ctx;
+  if (!rows.length || busy) return;
+  await replay(side, rows, REDUCE ? 0 : 650, ctx && ctx.d ? ctx.d.debitedRupees : null);
+}));
+initFlow("naive"); initFlow("saga");
+renderHero("naive", ZERO, false); renderHero("saga", ZERO, false);
+</script>
+</body>
+</html>

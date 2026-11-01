@@ -1,0 +1,1804 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Tatkal payment-booking consistency project (core stack, v5 - with the backoff recheck experiment).
+  DynamoDB tables, mock payment gateway, NAIVE flow, Step Functions SAGA, reconciler,
+  dead-letter queue + alarms, dashboard, batch runner. Delete the stack to remove everything.
+
+Parameters:
+  HoldSeconds:
+    Type: Number
+    Default: 120
+    Description: How long a seat hold lasts before it expires (DynamoDB TTL attribute holdExpiresAt)
+  ReconcilerMode:
+    Type: String
+    Default: SCAN
+    AllowedValues: [SCAN, BACKOFF]
+    Description: >
+      Who follows up on a payment whose result is unknown. SCAN = one reconciler sweeps every minute (baseline).
+      BACKOFF = each such payment gets its own recheck workflow that waits 2, 4, 8, 16, 32, 64 seconds between bank checks.
+
+Conditions:
+  IsScan: !Equals [!Ref ReconcilerMode, SCAN]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Tags:
+      project: tatkal
+    Environment:
+      Variables:
+        SEATS_TABLE: !Ref SeatsTable
+        PAYMENTS_TABLE: !Ref PaymentsTable
+        BOOKINGS_TABLE: !Ref BookingsTable
+        EVENTS_TABLE: !Ref EventsTable
+        ORDERS_TABLE: !Ref OrdersTable
+        HOLD_SECONDS: !Ref HoldSeconds
+        RECON_MODE: !Ref ReconcilerMode
+
+Resources:
+  # ------------------------------------------------------------------ data
+  # Seats: one item per seat. holdExpiresAt is the TTL attribute (epoch seconds).
+  SeatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-seats
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: seatId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+        - AttributeName: seatId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: holdExpiresAt
+        Enabled: true
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Payments: the mock gateway's own ledger (where money was "debited").
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-payments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Bookings: issued tickets.
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-bookings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: bookingId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: bookingId
+          KeyType: HASH
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Events: step-by-step log per transaction, used for the UI timeline.
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-events
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: txnId
+          AttributeType: S
+        - AttributeName: ts
+          AttributeType: S
+      KeySchema:
+        - AttributeName: txnId
+          KeyType: HASH
+        - AttributeName: ts
+          KeyType: RANGE
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Orders: the saga's own record per idempotency key (HELD, PAID, PAYMENT_UNKNOWN, CONFIRMED, REFUNDED ...).
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Dead-letter queue: orders that still fail after all retries wait here for a human.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: tatkal-dlq
+      MessageRetentionPeriod: 345600
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # ------------------------------------------------------------ mock gateway
+  GatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-gateway
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: default
+      InlineCode: |
+        import json, os, time, zlib, boto3
+        from botocore.exceptions import ClientError
+
+        pay = boto3.resource("dynamodb").Table(os.environ["PAYMENTS_TABLE"])
+        bus = boto3.client("events")
+
+
+        def handler(event, context):
+            """Mock payment gateway. action = charge (default) | status | refund."""
+            action = event.get("action", "charge")
+            pid = event["paymentId"]
+            old = pay.get_item(Key={"paymentId": pid}).get("Item")
+
+            if action == "status":
+                if not old:
+                    return {"paymentId": pid, "status": "NOT_FOUND"}
+                pay.update_item(Key={"paymentId": pid}, UpdateExpression="ADD statusChecks :one",
+                                ExpressionAttributeValues={":one": 1})  # counts every call to the bank
+                if time.time() < int(old.get("settleAt", 0)):  # a real bank needs a few seconds to settle
+                    return {"paymentId": pid, "status": "PENDING"}
+                return {"paymentId": pid, "status": old["status"]}
+
+            if action == "refund":
+                if event.get("failRefund"):
+                    raise RuntimeError("refund endpoint unavailable")
+                if not old or old["status"] != "CAPTURED":
+                    return {"paymentId": pid, "status": old["status"] if old else "NOT_FOUND"}
+                pay.update_item(
+                    Key={"paymentId": pid},
+                    UpdateExpression="SET #s = :r",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":r": "REFUNDED"},
+                )
+                # EventBridge PutEvents is a management event, so CloudTrail records every refund.
+                bus.put_events(Entries=[{
+                    "Source": "tatkal.gateway", "DetailType": "RefundIssued",
+                    "Detail": json.dumps({"paymentId": pid, "txnId": old["txnId"], "amount": int(old["amount"])}),
+                }])
+                return {"paymentId": pid, "status": "REFUNDED"}
+
+            mode = event.get("mode", "SUCCESS")
+            if old:  # idempotent replay: the same paymentId is never charged twice
+                s = "SUCCESS" if old["status"] == "CAPTURED" else old["status"]
+                return {"paymentId": pid, "status": s, "replayed": True}
+
+            status = "DECLINED" if mode == "DECLINE" else "CAPTURED"
+            now = int(time.time())
+            settle = now + 2 + zlib.crc32(pid.encode()) % 29 if mode == "TIMEOUT_BUT_CHARGED" else 0  # 2-30 s
+            try:
+                pay.put_item(
+                    Item={
+                        "paymentId": pid,
+                        "txnId": event["txnId"],
+                        "amount": int(event.get("amount", 500)),
+                        "status": status,
+                        "mode": mode,
+                        "createdAt": now,
+                        "settleAt": settle,
+                    },
+                    ConditionExpression="attribute_not_exists(paymentId)",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+                return {"paymentId": pid, "status": "SUCCESS", "replayed": True}
+
+            if mode == "TIMEOUT_BUT_CHARGED":
+                return {"paymentId": pid, "status": "TIMEOUT"}  # money taken, caller never hears back
+            return {"paymentId": pid, "status": "SUCCESS" if status == "CAPTURED" else "DECLINED"}
+
+  # ------------------------------------------------------------- naive flow
+  NaiveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-naive
+      Handler: index.handler
+      Timeout: 30
+      # Public URL used instead of API Gateway. Try: <url>?mode=TIMEOUT_BUT_CHARGED
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+      InlineCode: |
+        import json, os, uuid, datetime, boto3
+        from botocore.exceptions import ClientError
+
+        ddb = boto3.resource("dynamodb")
+        seats = ddb.Table(os.environ["SEATS_TABLE"])
+        bookings = ddb.Table(os.environ["BOOKINGS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+        lam = boto3.client("lambda")
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "NAIVE", "step": step, "message": msg})
+
+
+        def charge(txn, mode):
+            pid = "pay-" + uuid.uuid4().hex[:10]  # naive: a brand-new payment id on every attempt
+            body = {"paymentId": pid, "txnId": txn, "amount": 500, "mode": mode}
+            r = lam.invoke(FunctionName=os.environ["GATEWAY_FN"], Payload=json.dumps(body))
+            return json.loads(r["Payload"].read())
+
+
+        def handler(event, context):
+            """Works from console tests ({"mode": ...}) and from the function URL (?mode=...)."""
+            via_url = "requestContext" in event
+            if via_url:
+                if event.get("rawPath", "/") != "/":  # ignore /favicon.ico and other stray browser requests
+                    return {"statusCode": 404, "body": ""}
+                event = event.get("queryStringParameters") or {}
+            out = run(event)
+            if not via_url:
+                return out
+            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(out)}
+
+
+        def run(event):
+            """NAIVE flow: charge first, then book. Nothing repairs a failure in between.
+            mode = SUCCESS | DECLINE | TIMEOUT_BUT_CHARGED | BOOKING_FAILS_AFTER_PAY
+                   | DUPLICATE_CLICK | HOLD_EXPIRES_DURING_PAYMENT"""
+            txn = event.get("txnId") or "txn-" + uuid.uuid4().hex[:8]
+            eid = event.get("eventId", "E1")
+            sid = event.get("seatId") or "S-" + uuid.uuid4().hex[:6]
+            mode = event.get("mode", "SUCCESS")
+
+            log(txn, "START", "naive flow, mode=%s: charge first, then book" % mode)
+            clicks = 2 if mode == "DUPLICATE_CLICK" else 1
+            pay = None
+            for i in range(clicks):
+                pay = charge(txn, mode)
+                log(txn, "CHARGE", "click %d -> gateway says %s" % (i + 1, pay["status"]))
+
+            if pay["status"] != "SUCCESS":
+                log(txn, "END", "user is shown: payment failed, please retry")
+                return {"txnId": txn, "outcome": "PAYMENT_FAILED_SHOWN", "gateway": pay["status"]}
+
+            try:
+                if mode in ("BOOKING_FAILS_AFTER_PAY", "BOOKING_AND_REFUND_FAIL"):
+                    raise RuntimeError("booking service error")
+                if mode == "HOLD_EXPIRES_DURING_PAYMENT":  # someone else took the seat while we paid
+                    seats.put_item(Item={"eventId": eid, "seatId": sid, "txnId": "someone-else"})
+                seats.put_item(
+                    Item={"eventId": eid, "seatId": sid, "txnId": txn},
+                    ConditionExpression="attribute_not_exists(seatId)",
+                )
+                bookings.put_item(
+                    Item={"bookingId": "bk-" + uuid.uuid4().hex[:8], "txnId": txn,
+                          "paymentId": pay["paymentId"], "seatId": sid}
+                )
+                log(txn, "BOOKED", "ticket issued")
+                return {"txnId": txn, "outcome": "BOOKED"}
+            except (RuntimeError, ClientError) as e:
+                log(txn, "BOOK_FAILED", "%s - money already taken, no refund, no retry" % e)
+                return {"txnId": txn, "outcome": "PAID_NOT_BOOKED"}
+
+  # --------------------------------------------------------------- the saga
+  SagaReserveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-reserve
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      InlineCode: |
+        import os, time, datetime, boto3
+        from botocore.exceptions import ClientError
+
+        ddb = boto3.resource("dynamodb")
+        seats = ddb.Table(os.environ["SEATS_TABLE"])
+        orders = ddb.Table(os.environ["ORDERS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "SAGA", "step": step, "message": msg})
+
+
+        def handler(event, context):
+            """Saga step 1 - RESERVE. Idempotent on orderKey; holds the seat with a TTL before any payment."""
+            ctx = event["ctx"]
+            key, eid, sid = ctx["orderKey"], ctx["eventId"], ctx["seatId"]
+            now = int(time.time())
+            try:
+                orders.put_item(
+                    Item={"orderId": key, "status": "HELD", "eventId": eid, "seatId": sid,
+                          "mode": ctx["mode"], "createdAt": now, "updatedAt": now, "attempts": 0},
+                    ConditionExpression="attribute_not_exists(orderId)",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+                old = orders.get_item(Key={"orderId": key}).get("Item", {})
+                log(key, "DUPLICATE_IGNORED",
+                    "same idempotency key again (order is %s): no second hold, no second charge" % old.get("status"))
+                return {**ctx, "stage": "DUPLICATE"}
+            try:
+                seats.put_item(
+                    Item={"eventId": eid, "seatId": sid, "txnId": key, "status": "HELD",
+                          "holdExpiresAt": now + int(os.environ["HOLD_SECONDS"])},
+                    ConditionExpression="attribute_not_exists(seatId) OR (attribute_exists(holdExpiresAt) AND holdExpiresAt < :now)",
+                    ExpressionAttributeValues={":now": now},
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+                orders.update_item(Key={"orderId": key}, UpdateExpression="SET #s = :s, updatedAt = :t",
+                                   ExpressionAttributeNames={"#s": "status"},
+                                   ExpressionAttributeValues={":s": "SEAT_TAKEN", ":t": now})
+                log(key, "SEAT_TAKEN", "seat already held or booked: nothing was charged")
+                return {**ctx, "stage": "SEAT_TAKEN"}
+            log(key, "RESERVED", "seat held for %ss before any payment (conditional write + TTL)" % os.environ["HOLD_SECONDS"])
+            return {**ctx, "stage": "RESERVED"}
+
+  SagaPayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-pay
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+      InlineCode: |
+        import json, os, time, datetime, boto3
+
+        ddb = boto3.resource("dynamodb")
+        seats = ddb.Table(os.environ["SEATS_TABLE"])
+        orders = ddb.Table(os.environ["ORDERS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+        lam = boto3.client("lambda")
+
+
+        class TransientError(Exception):
+            pass
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "SAGA", "step": step, "message": msg})
+
+
+        def handler(event, context):
+            """Saga step 2 - PAY. The payment id is derived from the order key, so a retry or a
+            double click can never create a second charge."""
+            ctx = event["ctx"]
+            key, mode = ctx["orderKey"], ctx["mode"]
+            pid = "pay-" + key
+            seat = {"eventId": ctx["eventId"], "seatId": ctx["seatId"]}
+            now = int(time.time())
+
+            if mode == "HOLD_EXPIRES_DURING_PAYMENT":  # the payment page was slow: the hold ran out meanwhile
+                seats.update_item(Key=seat, UpdateExpression="SET holdExpiresAt = :p",
+                                  ExpressionAttributeValues={":p": now - 1})
+                log(key, "HOLD_EXPIRED", "payment took too long: the seat hold ran out while paying")
+
+            try:  # "Rate Exceeded" must become a retryable error, not a dead-letter message
+                r = lam.invoke(FunctionName=os.environ["GATEWAY_FN"],
+                               Payload=json.dumps({"paymentId": pid, "txnId": key, "amount": 500, "mode": mode}))
+            except Exception as e:
+                raise TransientError("gateway not reachable: %s" % e)
+            body = json.loads(r["Payload"].read())
+            if r.get("FunctionError"):
+                raise TransientError("gateway error: %s" % body.get("errorMessage"))
+
+            status = {"SUCCESS": "PAID", "DECLINED": "DECLINED", "TIMEOUT": "PAYMENT_UNKNOWN"}[body["status"]]
+            orders.update_item(Key={"orderId": key}, UpdateExpression="SET #s = :s, paymentId = :p, updatedAt = :t",
+                               ExpressionAttributeNames={"#s": "status"},
+                               ExpressionAttributeValues={":s": status, ":p": pid, ":t": now})
+            log(key, "PAY", "gateway says %s -> order %s" % (body["status"], status))
+            out = {**ctx, "paymentId": pid, "payStatus": body["status"]}
+            if body["status"] == "TIMEOUT":  # keep the seat while the reconciler finds out the truth
+                seats.update_item(Key=seat, UpdateExpression="SET holdExpiresAt = :p",
+                                  ExpressionAttributeValues={":p": now + 600})
+                log(key, "PENDING", "no reply from the gateway: order parked for the reconciler, hold extended")
+                out["stage"] = "PENDING_RECONCILE"
+            return out
+
+  SagaConfirmFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-confirm
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      InlineCode: |
+        import os, time, datetime, boto3
+        from botocore.exceptions import ClientError
+
+        ddb = boto3.resource("dynamodb")
+        seats = ddb.Table(os.environ["SEATS_TABLE"])
+        bookings = ddb.Table(os.environ["BOOKINGS_TABLE"])
+        orders = ddb.Table(os.environ["ORDERS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+
+
+        class BookingFailed(Exception):
+            pass
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "SAGA", "step": step, "message": msg})
+
+
+        def handler(event, context):
+            """Saga step 3 - CONFIRM. Turns the hold into a booking. Failing here triggers the refund branch."""
+            ctx = event["ctx"]
+            key = ctx["orderKey"]
+            now = int(time.time())
+            if ctx["mode"] in ("BOOKING_FAILS_AFTER_PAY", "BOOKING_AND_REFUND_FAIL"):
+                log(key, "CONFIRM_FAILED", "booking service error after payment: compensation starts")
+                raise BookingFailed("booking service error")
+            try:
+                seats.update_item(
+                    Key={"eventId": ctx["eventId"], "seatId": ctx["seatId"]},
+                    UpdateExpression="SET #s = :b REMOVE holdExpiresAt",
+                    ConditionExpression="txnId = :me AND (holdExpiresAt >= :now OR #s = :b)",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":b": "BOOKED", ":me": key, ":now": now},
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+                log(key, "CONFIRM_FAILED", "the hold expired before confirmation: compensation starts")
+                raise BookingFailed("hold expired")
+            try:
+                bookings.put_item(
+                    Item={"bookingId": "bk-" + key, "txnId": key, "paymentId": ctx["paymentId"], "seatId": ctx["seatId"]},
+                    ConditionExpression="attribute_not_exists(bookingId)",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise  # already booked by an earlier attempt: fine, confirm is idempotent
+            orders.update_item(Key={"orderId": key}, UpdateExpression="SET #s = :s, updatedAt = :t",
+                               ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":s": "CONFIRMED", ":t": now})
+            log(key, "BOOKED", "seat confirmed, ticket issued")
+            return {**ctx, "stage": "BOOKED"}
+
+  SagaRefundFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-refund
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+      InlineCode: |
+        import json, os, time, datetime, boto3
+
+        ddb = boto3.resource("dynamodb")
+        orders = ddb.Table(os.environ["ORDERS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+        lam = boto3.client("lambda")
+
+
+        class RefundFailed(Exception):
+            pass
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "SAGA", "step": step, "message": msg})
+
+
+        def handler(event, context):
+            """Compensation - REFUND the captured payment because the booking could not be completed."""
+            ctx = event["ctx"]
+            key = ctx["orderKey"]
+            try:  # "Rate Exceeded" is a refund failure the workflow retries, not a dead-letter message
+                r = lam.invoke(FunctionName=os.environ["GATEWAY_FN"],
+                               Payload=json.dumps({"action": "refund", "paymentId": ctx["paymentId"],
+                                                   "failRefund": ctx["mode"] == "BOOKING_AND_REFUND_FAIL"}))
+            except Exception as e:
+                raise RefundFailed("gateway not reachable: %s" % e)
+            body = json.loads(r["Payload"].read())
+            if r.get("FunctionError"):
+                log(key, "REFUND_FAILED", "refund call failed: %s" % body.get("errorMessage"))
+                raise RefundFailed(str(body.get("errorMessage")))
+            orders.update_item(Key={"orderId": key}, UpdateExpression="SET #s = :s, updatedAt = :t",
+                               ExpressionAttributeNames={"#s": "status"},
+                               ExpressionAttributeValues={":s": "REFUNDED", ":t": int(time.time())})
+            log(key, "REFUNDED", "payment refunded automatically (%s)" % body["status"])
+            return {**ctx, "refundStatus": body["status"]}
+
+  SagaReleaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-release
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      InlineCode: |
+        import os, time, datetime, boto3
+        from botocore.exceptions import ClientError
+
+        ddb = boto3.resource("dynamodb")
+        seats = ddb.Table(os.environ["SEATS_TABLE"])
+        orders = ddb.Table(os.environ["ORDERS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "SAGA", "step": step, "message": msg})
+
+
+        def handler(event, context):
+            """Compensation - RELEASE the seat hold and close the order (final = DECLINED or REFUNDED)."""
+            ctx, final = event["ctx"], event["final"]
+            key = ctx["orderKey"]
+            try:
+                seats.delete_item(Key={"eventId": ctx["eventId"], "seatId": ctx["seatId"]},
+                                  ConditionExpression="txnId = :me", ExpressionAttributeValues={":me": key})
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise  # the seat is no longer ours: nothing to release
+            orders.update_item(Key={"orderId": key}, UpdateExpression="SET #s = :s, updatedAt = :t",
+                               ExpressionAttributeNames={"#s": "status"},
+                               ExpressionAttributeValues={":s": final, ":t": int(time.time())})
+            log(key, "RELEASED", "seat hold released, order closed as %s" % final)
+            return {**ctx, "stage": final}
+
+  # Standard workflow: you can open each execution and see the graph (screenshots).
+  SagaStandardMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: tatkal-saga
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReserveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaPayFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaConfirmFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaRefundFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReleaseFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RecheckMachine
+      DefinitionSubstitutions:
+        ReserveFn: !GetAtt SagaReserveFunction.Arn
+        PayFn: !GetAtt SagaPayFunction.Arn
+        ConfirmFn: !GetAtt SagaConfirmFunction.Arn
+        RefundFn: !GetAtt SagaRefundFunction.Arn
+        ReleaseFn: !GetAtt SagaReleaseFunction.Arn
+        DlqUrl: !Ref DeadLetterQueue
+        ReconMode: !Ref ReconcilerMode
+        RecheckSm: !Ref RecheckMachine
+      Definition:
+        Comment: Tatkal booking saga - Reserve, Pay, Confirm, with compensation (refund, release) and a dead-letter queue
+        StartAt: Reserve
+        States:
+          Reserve:
+            Type: Task
+            Resource: ${ReserveFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            Next: ReserveResult
+
+          ReserveResult:
+            Type: Choice
+            Choices:
+              - Variable: $.stage
+                StringEquals: DUPLICATE
+                Next: DuplicateIgnored
+              - Variable: $.stage
+                StringEquals: SEAT_TAKEN
+                Next: SeatTaken
+            Default: Pay
+
+          Pay:
+            Type: Task
+            Resource: ${PayFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+              - ErrorEquals: [TransientError]
+                IntervalSeconds: 2
+                MaxAttempts: 6
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            Next: PayResult
+
+          PayResult:
+            Type: Choice
+            Choices:
+              - Variable: $.payStatus
+                StringEquals: SUCCESS
+                Next: Confirm
+              - Variable: $.payStatus
+                StringEquals: DECLINED
+                Next: ReleaseDeclined
+              - Variable: $.payStatus
+                StringEquals: TIMEOUT
+                Next: ReadMode
+            Default: ToDLQ
+
+          # The stack setting ReconcilerMode decides who follows up on an unclear payment:
+          # SCAN = the once-a-minute reconciler picks it up; BACKOFF = its own recheck workflow starts now.
+          ReadMode:
+            Type: Pass
+            Result: ${ReconMode}
+            ResultPath: $.reconMode
+            Next: ModeChoice
+
+          ModeChoice:
+            Type: Choice
+            Choices:
+              - Variable: $.reconMode
+                StringEquals: BACKOFF
+                Next: StartRecheck
+            Default: PendingReconcile
+
+          StartRecheck:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution
+            Parameters:
+              StateMachineArn: ${RecheckSm}
+              Input:
+                orderKey.$: $.orderKey
+            ResultPath: null
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            Next: PendingReconcile
+
+          Confirm:
+            Type: Task
+            Resource: ${ConfirmFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Refund
+            Next: Booked
+
+          Refund:
+            Type: Task
+            Resource: ${RefundFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+              - ErrorEquals: [RefundFailed]
+                IntervalSeconds: 1
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            ResultPath: $
+            Next: ReleaseRefunded
+
+          ReleaseRefunded:
+            Type: Task
+            Resource: ${ReleaseFn}
+            Parameters:
+              ctx.$: $
+              final: REFUNDED
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Next: Refunded
+
+          ReleaseDeclined:
+            Type: Task
+            Resource: ${ReleaseFn}
+            Parameters:
+              ctx.$: $
+              final: DECLINED
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Next: Declined
+
+          ToDLQ:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage
+            Parameters:
+              QueueUrl: ${DlqUrl}
+              MessageBody.$: States.JsonToString($)
+            ResultPath: null
+            Next: NeedsManualReview
+
+          NeedsManualReview:
+            Type: Fail
+            Error: NeedsManualReview
+            Cause: Compensation failed after retries; the order was sent to the dead-letter queue
+
+          Booked:
+            Type: Succeed
+          Refunded:
+            Type: Succeed
+          Declined:
+            Type: Succeed
+          PendingReconcile:
+            Type: Succeed
+          DuplicateIgnored:
+            Type: Succeed
+          SeatTaken:
+            Type: Succeed
+
+  # Express copy of the same definition: returns the result immediately (used by the page and the batch).
+  SagaExpressMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: tatkal-saga-express
+      Type: EXPRESS
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReserveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaPayFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaConfirmFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaRefundFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReleaseFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RecheckMachine
+      DefinitionSubstitutions:
+        ReserveFn: !GetAtt SagaReserveFunction.Arn
+        PayFn: !GetAtt SagaPayFunction.Arn
+        ConfirmFn: !GetAtt SagaConfirmFunction.Arn
+        RefundFn: !GetAtt SagaRefundFunction.Arn
+        ReleaseFn: !GetAtt SagaReleaseFunction.Arn
+        DlqUrl: !Ref DeadLetterQueue
+        ReconMode: !Ref ReconcilerMode
+        RecheckSm: !Ref RecheckMachine
+      Definition:
+        Comment: Tatkal booking saga - Reserve, Pay, Confirm, with compensation (refund, release) and a dead-letter queue
+        StartAt: Reserve
+        States:
+          Reserve:
+            Type: Task
+            Resource: ${ReserveFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            Next: ReserveResult
+
+          ReserveResult:
+            Type: Choice
+            Choices:
+              - Variable: $.stage
+                StringEquals: DUPLICATE
+                Next: DuplicateIgnored
+              - Variable: $.stage
+                StringEquals: SEAT_TAKEN
+                Next: SeatTaken
+            Default: Pay
+
+          Pay:
+            Type: Task
+            Resource: ${PayFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+              - ErrorEquals: [TransientError]
+                IntervalSeconds: 2
+                MaxAttempts: 6
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            Next: PayResult
+
+          PayResult:
+            Type: Choice
+            Choices:
+              - Variable: $.payStatus
+                StringEquals: SUCCESS
+                Next: Confirm
+              - Variable: $.payStatus
+                StringEquals: DECLINED
+                Next: ReleaseDeclined
+              - Variable: $.payStatus
+                StringEquals: TIMEOUT
+                Next: ReadMode
+            Default: ToDLQ
+
+          # The stack setting ReconcilerMode decides who follows up on an unclear payment:
+          # SCAN = the once-a-minute reconciler picks it up; BACKOFF = its own recheck workflow starts now.
+          ReadMode:
+            Type: Pass
+            Result: ${ReconMode}
+            ResultPath: $.reconMode
+            Next: ModeChoice
+
+          ModeChoice:
+            Type: Choice
+            Choices:
+              - Variable: $.reconMode
+                StringEquals: BACKOFF
+                Next: StartRecheck
+            Default: PendingReconcile
+
+          StartRecheck:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution
+            Parameters:
+              StateMachineArn: ${RecheckSm}
+              Input:
+                orderKey.$: $.orderKey
+            ResultPath: null
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            Next: PendingReconcile
+
+          Confirm:
+            Type: Task
+            Resource: ${ConfirmFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Refund
+            Next: Booked
+
+          Refund:
+            Type: Task
+            Resource: ${RefundFn}
+            Parameters:
+              ctx.$: $
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+              - ErrorEquals: [RefundFailed]
+                IntervalSeconds: 1
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ToDLQ
+            ResultPath: $
+            Next: ReleaseRefunded
+
+          ReleaseRefunded:
+            Type: Task
+            Resource: ${ReleaseFn}
+            Parameters:
+              ctx.$: $
+              final: REFUNDED
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Next: Refunded
+
+          ReleaseDeclined:
+            Type: Task
+            Resource: ${ReleaseFn}
+            Parameters:
+              ctx.$: $
+              final: DECLINED
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 1
+                MaxAttempts: 5
+                BackoffRate: 2
+            Next: Declined
+
+          ToDLQ:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage
+            Parameters:
+              QueueUrl: ${DlqUrl}
+              MessageBody.$: States.JsonToString($)
+            ResultPath: null
+            Next: NeedsManualReview
+
+          NeedsManualReview:
+            Type: Fail
+            Error: NeedsManualReview
+            Cause: Compensation failed after retries; the order was sent to the dead-letter queue
+
+          Booked:
+            Type: Succeed
+          Refunded:
+            Type: Succeed
+          Declined:
+            Type: Succeed
+          PendingReconcile:
+            Type: Succeed
+          DuplicateIgnored:
+            Type: Succeed
+          SeatTaken:
+            Type: Succeed
+
+  # Novelty: one small workflow per unclear payment. It waits, asks the bank, waits twice as long, asks again.
+  # Used only when ReconcilerMode = BACKOFF (the saga starts it); in SCAN mode it is never started.
+  RecheckMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: tatkal-recheck
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReconcilerFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+      DefinitionSubstitutions:
+        ReconcilerFn: !GetAtt ReconcilerFunction.Arn
+        DlqUrl: !Ref DeadLetterQueue
+      Definition:
+        Comment: Per-payment recheck with exponential backoff. Wait a little, ask the bank, wait twice as long, ask again.
+        StartAt: Wait1
+        States:
+          Wait1:
+            Type: Wait
+            Seconds: 2
+            Next: Check1
+
+          Check1:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReconcilerFn}
+              Payload:
+                orderId.$: $.orderKey
+            ResultSelector:
+              open.$: $.Payload.open
+            ResultPath: $.check
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Wait2
+            Next: Done1
+
+          Done1:
+            Type: Choice
+            Choices:
+              - Variable: $.check.open
+                NumericEquals: 0
+                Next: Resolved
+            Default: Wait2
+
+          Wait2:
+            Type: Wait
+            Seconds: 4
+            Next: Check2
+
+          Check2:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReconcilerFn}
+              Payload:
+                orderId.$: $.orderKey
+            ResultSelector:
+              open.$: $.Payload.open
+            ResultPath: $.check
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Wait3
+            Next: Done2
+
+          Done2:
+            Type: Choice
+            Choices:
+              - Variable: $.check.open
+                NumericEquals: 0
+                Next: Resolved
+            Default: Wait3
+
+          Wait3:
+            Type: Wait
+            Seconds: 8
+            Next: Check3
+
+          Check3:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReconcilerFn}
+              Payload:
+                orderId.$: $.orderKey
+            ResultSelector:
+              open.$: $.Payload.open
+            ResultPath: $.check
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Wait4
+            Next: Done3
+
+          Done3:
+            Type: Choice
+            Choices:
+              - Variable: $.check.open
+                NumericEquals: 0
+                Next: Resolved
+            Default: Wait4
+
+          Wait4:
+            Type: Wait
+            Seconds: 16
+            Next: Check4
+
+          Check4:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReconcilerFn}
+              Payload:
+                orderId.$: $.orderKey
+            ResultSelector:
+              open.$: $.Payload.open
+            ResultPath: $.check
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Wait5
+            Next: Done4
+
+          Done4:
+            Type: Choice
+            Choices:
+              - Variable: $.check.open
+                NumericEquals: 0
+                Next: Resolved
+            Default: Wait5
+
+          Wait5:
+            Type: Wait
+            Seconds: 32
+            Next: Check5
+
+          Check5:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReconcilerFn}
+              Payload:
+                orderId.$: $.orderKey
+            ResultSelector:
+              open.$: $.Payload.open
+            ResultPath: $.check
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Wait6
+            Next: Done5
+
+          Done5:
+            Type: Choice
+            Choices:
+              - Variable: $.check.open
+                NumericEquals: 0
+                Next: Resolved
+            Default: Wait6
+
+          Wait6:
+            Type: Wait
+            Seconds: 64
+            Next: Check6
+
+          Check6:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReconcilerFn}
+              Payload:
+                orderId.$: $.orderKey
+            ResultSelector:
+              open.$: $.Payload.open
+            ResultPath: $.check
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: GiveUp
+            Next: Done6
+
+          Done6:
+            Type: Choice
+            Choices:
+              - Variable: $.check.open
+                NumericEquals: 0
+                Next: Resolved
+            Default: GiveUp
+
+          GiveUp:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage
+            Parameters:
+              QueueUrl: ${DlqUrl}
+              MessageBody.$: States.JsonToString($)
+            ResultPath: null
+            Next: NeedsManualReview
+
+          NeedsManualReview:
+            Type: Fail
+            Error: NeedsManualReview
+            Cause: The bank never settled this payment within the recheck schedule; a human must look at it
+
+          Resolved:
+            Type: Succeed
+
+  SagaStartFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-start
+      Handler: index.handler
+      Timeout: 60
+      # Public URL. Try: <url>?mode=TIMEOUT_BUT_CHARGED   (add &std=1 to watch the graph in the console)
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Environment:
+        Variables:
+          EXPRESS_SM: !Ref SagaExpressMachine
+          STANDARD_SM: !Ref SagaStandardMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: states:StartSyncExecution
+              Resource: !Ref SagaExpressMachine
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref SagaStandardMachine
+      InlineCode: |
+        import json, os, uuid, boto3
+        from concurrent.futures import ThreadPoolExecutor
+
+        sfn = boto3.client("stepfunctions")
+
+
+        def start(inp, standard):
+            if standard:  # asynchronous: watch the execution graph in the Step Functions console
+                r = sfn.start_execution(stateMachineArn=os.environ["STANDARD_SM"],
+                                        name=inp["orderKey"] + "-" + uuid.uuid4().hex[:6], input=json.dumps(inp))
+                return {"status": "STARTED", "executionArn": r["executionArn"]}
+            r = sfn.start_sync_execution(stateMachineArn=os.environ["EXPRESS_SM"], input=json.dumps(inp))
+            out = json.loads(r["output"]) if r.get("output") else {}
+            return {"status": r["status"], "stage": out.get("stage") or r.get("error", "FAILED")}
+
+
+        def handler(event, context):
+            """Starts the saga. Works from console tests ({"mode": ...}) and from the function URL (?mode=...&std=1).
+            DUPLICATE_CLICK starts the same order twice at the same moment, like a double click."""
+            via_url = "requestContext" in event
+            if via_url:
+                if event.get("rawPath", "/") != "/":
+                    return {"statusCode": 404, "body": ""}
+                event = event.get("queryStringParameters") or {}
+            mode = event.get("mode", "SUCCESS")
+            inp = {"orderKey": event.get("key") or "sg-" + uuid.uuid4().hex[:8],
+                   "eventId": event.get("eventId", "E1"),
+                   "seatId": event.get("seatId") or "S-" + uuid.uuid4().hex[:6], "mode": mode}
+            standard = str(event.get("std", "")).lower() in ("1", "true")
+            clicks = 2 if mode == "DUPLICATE_CLICK" else 1
+            with ThreadPoolExecutor(clicks) as ex:
+                res = list(ex.map(lambda _: start(inp, standard), range(clicks)))
+            main = next((r for r in res if r.get("stage") != "DUPLICATE"), res[0])
+            out = {"orderKey": inp["orderKey"], "outcome": main.get("stage") or main["status"], "executions": res}
+            if not via_url:
+                return out
+            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(out)}
+
+  # ------------------------------------------------------------- reconciler
+  ReconcilerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-reconciler
+      Handler: index.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+          DLQ_URL: !Ref DeadLetterQueue
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            State: !If [IsScan, ENABLED, DISABLED]
+      InlineCode: |
+        import json, os, time, datetime, boto3
+        from botocore.exceptions import ClientError
+        from boto3.dynamodb.conditions import Attr
+
+        ddb = boto3.resource("dynamodb")
+        seats = ddb.Table(os.environ["SEATS_TABLE"])
+        orders = ddb.Table(os.environ["ORDERS_TABLE"])
+        bookings = ddb.Table(os.environ["BOOKINGS_TABLE"])
+        events = ddb.Table(os.environ["EVENTS_TABLE"])
+        lam = boto3.client("lambda")
+        sqs = boto3.client("sqs")
+        MAX_ATTEMPTS = 5
+
+
+        def log(txn, step, msg):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            events.put_item(Item={"txnId": txn, "ts": now, "flow": "RECONCILER", "step": step, "message": msg})
+
+
+        def gateway(body):
+            r = lam.invoke(FunctionName=os.environ["GATEWAY_FN"], Payload=json.dumps(body))
+            out = json.loads(r["Payload"].read())
+            if r.get("FunctionError"):
+                raise RuntimeError(out.get("errorMessage"))
+            return out
+
+
+        def close(o, status, now, note):
+            orders.update_item(Key={"orderId": o["orderId"]},
+                               UpdateExpression="SET #s = :s, updatedAt = :t, resolveSecs = :r",
+                               ExpressionAttributeNames={"#s": "status"},
+                               ExpressionAttributeValues={":s": status, ":t": now, ":r": now - int(o["updatedAt"])})
+            log(o["orderId"], status, note)
+
+
+        def put(table, **kw):
+            try:
+                table.put_item(**kw)
+                return True
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+                return False
+
+
+        def take_seat(o, now):
+            return put(seats, Item={"eventId": o["eventId"], "seatId": o["seatId"], "txnId": o["orderId"], "status": "BOOKED"},
+                       ConditionExpression="attribute_not_exists(seatId) OR txnId = :me OR "
+                                           "(attribute_exists(holdExpiresAt) AND holdExpiresAt < :now)",
+                       ExpressionAttributeValues={":me": o["orderId"], ":now": now})
+
+
+        def resolve(o, now):
+            pid = o.get("paymentId") or "pay-" + o["orderId"]
+            st = gateway({"action": "status", "paymentId": pid})["status"]
+            if st == "CAPTURED":
+                if take_seat(o, now):
+                    put(bookings, Item={"bookingId": "bk-" + o["orderId"], "txnId": o["orderId"],
+                                        "paymentId": pid, "seatId": o["seatId"]},
+                        ConditionExpression="attribute_not_exists(bookingId)")
+                    close(o, "CONFIRMED", now, "money was taken: seat booked after the fact")
+                else:
+                    gateway({"action": "refund", "paymentId": pid})
+                    close(o, "REFUNDED", now, "money taken but seat gone: refunded")
+            elif st == "PENDING":
+                return 0  # bank not settled yet
+            elif st in ("DECLINED", "NOT_FOUND"):
+                close(o, "RELEASED", now, "no money was taken: order released")
+            elif st == "REFUNDED":
+                close(o, "REFUNDED", now, "already refunded")
+
+
+        def handler(event, context):
+            now = int(time.time())
+            k = event.get("orderId")  # set by the recheck workflow
+            pending = [orders.get_item(Key={"orderId": k}).get("Item")] if k else \
+                orders.scan(FilterExpression=Attr("status").eq("PAYMENT_UNKNOWN"))["Items"]
+            pending = [o for o in pending if o and o["status"] == "PAYMENT_UNKNOWN"]
+            done = 0
+            for o in pending:
+                try:
+                    done += resolve(o, now) != 0
+                except Exception as e:  # after MAX_ATTEMPTS ask a human
+                    n = int(o.get("attempts", 0)) + 1
+                    stop = n >= MAX_ATTEMPTS
+                    orders.update_item(Key={"orderId": o["orderId"]}, UpdateExpression="SET attempts = :n, #s = :s",
+                                       ExpressionAttributeNames={"#s": "status"},
+                                       ExpressionAttributeValues={":n": n, ":s": "NEEDS_REVIEW" if stop else o["status"]})
+                    log(o["orderId"], "RETRY", "attempt %d failed: %s" % (n, e))
+                    if stop:
+                        sqs.send_message(QueueUrl=os.environ["DLQ_URL"], MessageBody=json.dumps(o, default=str))
+            return {"checked": len(pending), "resolved": done, "open": len(pending) - done}
+
+  # ------------------------------------------------------ ledger + batch runner
+  LedgerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-ledger
+      Handler: index.handler
+      Timeout: 60
+      # Public read-only totals and timelines. Reset is blocked when called through the URL.
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      InlineCode: |
+        import json, os, time, boto3
+        from boto3.dynamodb.conditions import Key
+
+        ddb = boto3.resource("dynamodb")
+        T = {n: ddb.Table(os.environ[n.upper() + "_TABLE"]) for n in ("payments", "bookings", "seats", "events", "orders")}
+        KEYS = {"payments": ["paymentId"], "bookings": ["bookingId"], "seats": ["eventId", "seatId"],
+                "events": ["txnId", "ts"], "orders": ["orderId"]}
+        PREFIX = {"NAIVE": "txn-", "SAGA": "sg-"}
+
+
+        def scan(t):
+            out, kw = [], {}
+            while True:
+                r = t.scan(**kw)
+                out += r["Items"]
+                if "LastEvaluatedKey" not in r:
+                    return out
+                kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
+
+
+        def totals(flow):
+            keep = lambda txn: flow == "ALL" or txn.startswith(PREFIX[flow])
+            pays = [p for p in scan(T["payments"]) if keep(p["txnId"])]
+            books = [b for b in scan(T["bookings"]) if keep(b["txnId"])]
+            ords = [o for o in scan(T["orders"]) if keep(o["orderId"])]
+            captured = {}
+            for p in pays:
+                if p["status"] == "CAPTURED":
+                    captured.setdefault(p["txnId"], []).append(p)
+            booked = {b["txnId"] for b in books}
+            secs = [float(o["resolveSecs"]) for o in ords if "resolveSecs" in o]
+            out = {
+                "flow": flow,
+                "payments": len(pays),
+                "debitedRupees": sum(int(p["amount"]) for ps in captured.values() for p in ps),
+                "ticketsIssued": len(books),
+                "orphanedPayments": sum(1 for t in captured if t not in booked),
+                "duplicateCharges": sum(len(ps) - 1 for ps in captured.values()),
+                "refunded": sum(1 for p in pays if p["status"] == "REFUNDED"),
+                "pendingReconcile": sum(1 for o in ords if o["status"] == "PAYMENT_UNKNOWN"),
+                "needsReview": sum(1 for o in ords if o["status"] == "NEEDS_REVIEW"),
+                "avgResolveSecs": round(sum(secs) / len(secs), 1) if secs else None,
+                "maxResolveSecs": max(secs) if secs else None,
+                "bankStatusCalls": sum(int(p.get("statusChecks", 0)) for p in pays),
+                "paymentsChecked": sum(1 for p in pays if p.get("statusChecks")),
+                "reconcilerMode": os.environ.get("RECON_MODE", "SCAN"),
+            }
+            if flow in PREFIX:  # CloudWatch Embedded Metric Format: becomes dashboard metrics for free
+                m = ("OrphanedPayments", "DuplicateCharges", "PendingReconcile")
+                print(json.dumps({"_aws": {"Timestamp": int(time.time() * 1000), "CloudWatchMetrics": [
+                    {"Namespace": "Tatkal", "Dimensions": [["Flow"]], "Metrics": [{"Name": n, "Unit": "Count"} for n in m]}]},
+                    "Flow": flow, "OrphanedPayments": out["orphanedPayments"],
+                    "DuplicateCharges": out["duplicateCharges"], "PendingReconcile": out["pendingReconcile"]}))
+            return out
+
+
+        def handler(event, context):
+            """{} / ?flow=NAIVE|SAGA -> totals. ?events=<txnId> -> step timeline.
+            {"action":"reset"} -> empty all tables (console tests and the batch runner only, never the public URL)."""
+            via_url = "requestContext" in event
+            if via_url:
+                if event.get("rawPath", "/") != "/":
+                    return {"statusCode": 404, "body": ""}
+                event = event.get("queryStringParameters") or {}
+            if not via_url and event.get("action") == "reset":
+                for name, keys in KEYS.items():
+                    with T[name].batch_writer() as b:
+                        for it in scan(T[name]):
+                            b.delete_item(Key={k: it[k] for k in keys})
+                return {"reset": True}
+            if event.get("events"):
+                rows = T["events"].query(KeyConditionExpression=Key("txnId").eq(event["events"]))["Items"]
+                out = [{k: r.get(k) for k in ("ts", "flow", "step", "message")} for r in rows]
+            else:
+                out = totals(str(event.get("flow", "ALL")).upper())
+            if not via_url:
+                return out
+            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(out)}
+
+  BatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-batch
+      Handler: index.handler
+      Timeout: 300
+      # Public URL. Try: <url>?n=200&failPct=30
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Environment:
+        Variables:
+          NAIVE_FN: !Ref NaiveFunction
+          LEDGER_FN: !Ref LedgerFunction
+          EXPRESS_SM: !Ref SagaExpressMachine
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref NaiveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LedgerFunction
+        - Statement:
+            - Effect: Allow
+              Action: states:StartSyncExecution
+              Resource: !Ref SagaExpressMachine
+      InlineCode: |
+        import json, os, random, time, uuid, boto3
+        from concurrent.futures import ThreadPoolExecutor
+
+        lam = boto3.client("lambda")
+        sfn = boto3.client("stepfunctions")
+        FAILS = ["TIMEOUT_BUT_CHARGED", "BOOKING_FAILS_AFTER_PAY", "DUPLICATE_CLICK", "HOLD_EXPIRES_DURING_PAYMENT"]
+
+
+        def call(fn, payload):
+            for i in range(6):  # new accounts have low concurrency limits: back off and retry on throttling
+                try:
+                    r = lam.invoke(FunctionName=fn, Payload=json.dumps(payload))
+                    return json.loads(r["Payload"].read())
+                except lam.exceptions.TooManyRequestsException:
+                    time.sleep(0.5 * 2 ** i)
+            raise RuntimeError("throttled")
+
+
+        def run_naive(i, mode):
+            call(os.environ["NAIVE_FN"], {"txnId": "txn-b%03d" % i, "eventId": "NAIVE-SHOW", "seatId": "B%03d" % i, "mode": mode})
+
+
+        def saga_once(inp):
+            for k in range(6):
+                r = sfn.start_sync_execution(stateMachineArn=os.environ["EXPRESS_SM"], input=json.dumps(inp))
+                if r["status"] != "FAILED" or r.get("error") == "NeedsManualReview":
+                    return r
+                time.sleep(0.5 * 2 ** k)
+
+
+        def run_saga(i, mode):
+            inp = {"orderKey": "sg-b%03d" % i, "eventId": "SAGA-SHOW", "seatId": "B%03d" % i, "mode": mode}
+            with ThreadPoolExecutor(2 if mode == "DUPLICATE_CLICK" else 1) as ex:  # a double click = two executions
+                list(ex.map(lambda _: saga_once(inp), range(2 if mode == "DUPLICATE_CLICK" else 1)))
+
+
+        def handler(event, context):
+            """Runs the SAME N scenarios through the naive flow and then the saga, and returns both ledgers."""
+            via_url = "requestContext" in event
+            if via_url:
+                if event.get("rawPath", "/") != "/":
+                    return {"statusCode": 404, "body": ""}
+                event = event.get("queryStringParameters") or {}
+            n = max(1, min(int(event.get("n", 200)), 300))
+            pct = max(0, min(int(event.get("failPct", 30)), 100))
+            rnd = random.Random(42)  # fixed seed: both flows and every rerun get identical scenarios
+            modes = []
+            for _ in range(n):
+                x = rnd.random() * 100
+                modes.append(rnd.choice(FAILS) if x < pct else ("DECLINE" if x < pct + 5 else "SUCCESS"))
+            if str(event.get("reset", "1")) != "0":
+                call(os.environ["LEDGER_FN"], {"action": "reset"})
+            t0 = time.time()
+            with ThreadPoolExecutor(3) as ex:
+                list(ex.map(lambda a: run_naive(*a), enumerate(modes)))
+            t1 = time.time()
+            with ThreadPoolExecutor(3) as ex:
+                list(ex.map(lambda a: run_saga(*a), enumerate(modes)))
+            t2 = time.time()
+            out = {"n": n, "failPct": pct,
+                   "scenarios": {m: modes.count(m) for m in sorted(set(modes))},
+                   "naive": call(os.environ["LEDGER_FN"], {"flow": "NAIVE"}),
+                   "saga": call(os.environ["LEDGER_FN"], {"flow": "SAGA"}),
+                   "seconds": {"naive": round(t1 - t0, 1), "saga": round(t2 - t1, 1)},
+                   "note": "Saga orders with pendingReconcile > 0 are payments whose result was unknown; "
+                           "the reconciler (every minute) resolves them. Re-open the ledger a minute later."}
+            if not via_url:
+                return out
+            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(out)}
+
+  # First Lambda from Session 0: writes one row to the Events table.
+  PingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-ping
+      Handler: index.handler
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      Events:
+        PingApi:
+          Type: HttpApi
+          Properties:
+            Path: /ping
+            Method: GET
+      InlineCode: |
+        import json, os, uuid, datetime
+        import boto3
+
+        table = boto3.resource("dynamodb").Table(os.environ["EVENTS_TABLE"])
+
+        def handler(event, context):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            item = {
+                "txnId": "ping-" + uuid.uuid4().hex[:8],
+                "ts": now,
+                "step": "PING",
+                "message": "Lambda reached DynamoDB",
+            }
+            table.put_item(Item=item)
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"ok": True, "wrote": item}),
+            }
+
+  # ----------------------------------------------------- alarms and dashboard
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tatkal-dlq-not-empty
+      AlarmDescription: An order needs manual review (it failed after all retries)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  SagaFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tatkal-saga-failed
+      AlarmDescription: A saga execution ended in NeedsManualReview
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref SagaExpressMachine
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: tatkal
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Orphaned payments (paid, no ticket) by flow", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [["Tatkal", "OrphanedPayments", "Flow", "NAIVE"], ["Tatkal", "OrphanedPayments", "Flow", "SAGA"]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Duplicate charges by flow", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [["Tatkal", "DuplicateCharges", "Flow", "NAIVE"], ["Tatkal", "DuplicateCharges", "Flow", "SAGA"]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Saga executions (Express)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+            "metrics": [["AWS/States", "ExecutionsStarted", "StateMachineArn", "${SagaExpressMachine}"], [".", "ExecutionsSucceeded", ".", "."], [".", "ExecutionsFailed", ".", "."]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Lambda invocations and errors", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+            "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "tatkal-naive"], [".", ".", ".", "tatkal-saga-pay"], [".", ".", ".", "tatkal-reconciler"], [".", "Errors", ".", "tatkal-gateway"], [".", ".", ".", "tatkal-saga-confirm"]]}},
+          {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
+            "title": "Dead-letter queue: orders waiting for a human", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "tatkal-dlq"]]}},
+          {"type": "alarm", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
+            "title": "Alarms", "alarms": ["${DlqAlarm.Arn}", "${SagaFailedAlarm.Arn}"]}}
+        ]}
+
+Outputs:
+  NaiveUrl:
+    Description: Naive flow in a browser, e.g. add ?mode=TIMEOUT_BUT_CHARGED
+    Value: !GetAtt NaiveFunctionUrl.FunctionUrl
+  SagaUrl:
+    Description: Saga flow in a browser, e.g. add ?mode=TIMEOUT_BUT_CHARGED
+    Value: !GetAtt SagaStartFunctionUrl.FunctionUrl
+  LedgerUrl:
+    Description: Totals (add ?flow=NAIVE or ?flow=SAGA) or a timeline (add ?events=TXN_ID)
+    Value: !GetAtt LedgerFunctionUrl.FunctionUrl
+  BatchUrl:
+    Description: Runs the same N scenarios through both flows (add ?n=200&failPct=30). Takes about 2 minutes.
+    Value: !GetAtt BatchFunctionUrl.FunctionUrl
+  DlqUrl:
+    Description: Dead-letter queue URL
+    Value: !Ref DeadLetterQueue
+  PingUrl:
+    Description: Public test URL (may show "Healthy Connection" while the account is being verified)
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ping"

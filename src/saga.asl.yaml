@@ -1,0 +1,183 @@
+Comment: Tatkal booking saga - Reserve, Pay, Confirm, with compensation (refund, release) and a dead-letter queue
+StartAt: Reserve
+States:
+  Reserve:
+    Type: Task
+    Resource: ${ReserveFn}
+    Parameters:
+      ctx.$: $
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 1
+        MaxAttempts: 5
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: ToDLQ
+    Next: ReserveResult
+
+  ReserveResult:
+    Type: Choice
+    Choices:
+      - Variable: $.stage
+        StringEquals: DUPLICATE
+        Next: DuplicateIgnored
+      - Variable: $.stage
+        StringEquals: SEAT_TAKEN
+        Next: SeatTaken
+    Default: Pay
+
+  Pay:
+    Type: Task
+    Resource: ${PayFn}
+    Parameters:
+      ctx.$: $
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 1
+        MaxAttempts: 5
+        BackoffRate: 2
+      - ErrorEquals: [TransientError]
+        IntervalSeconds: 2
+        MaxAttempts: 6
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: ToDLQ
+    Next: PayResult
+
+  PayResult:
+    Type: Choice
+    Choices:
+      - Variable: $.payStatus
+        StringEquals: SUCCESS
+        Next: Confirm
+      - Variable: $.payStatus
+        StringEquals: DECLINED
+        Next: ReleaseDeclined
+      - Variable: $.payStatus
+        StringEquals: TIMEOUT
+        Next: ReadMode
+    Default: ToDLQ
+
+  # The stack setting ReconcilerMode decides who follows up on an unclear payment:
+  # SCAN = the once-a-minute reconciler picks it up; BACKOFF = its own recheck workflow starts now.
+  ReadMode:
+    Type: Pass
+    Result: ${ReconMode}
+    ResultPath: $.reconMode
+    Next: ModeChoice
+
+  ModeChoice:
+    Type: Choice
+    Choices:
+      - Variable: $.reconMode
+        StringEquals: BACKOFF
+        Next: StartRecheck
+    Default: PendingReconcile
+
+  StartRecheck:
+    Type: Task
+    Resource: arn:aws:states:::states:startExecution
+    Parameters:
+      StateMachineArn: ${RecheckSm}
+      Input:
+        orderKey.$: $.orderKey
+    ResultPath: null
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: ToDLQ
+    Next: PendingReconcile
+
+  Confirm:
+    Type: Task
+    Resource: ${ConfirmFn}
+    Parameters:
+      ctx.$: $
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 1
+        MaxAttempts: 5
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: Refund
+    Next: Booked
+
+  Refund:
+    Type: Task
+    Resource: ${RefundFn}
+    Parameters:
+      ctx.$: $
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 1
+        MaxAttempts: 5
+        BackoffRate: 2
+      - ErrorEquals: [RefundFailed]
+        IntervalSeconds: 1
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: ToDLQ
+    ResultPath: $
+    Next: ReleaseRefunded
+
+  ReleaseRefunded:
+    Type: Task
+    Resource: ${ReleaseFn}
+    Parameters:
+      ctx.$: $
+      final: REFUNDED
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 1
+        MaxAttempts: 5
+        BackoffRate: 2
+    Next: Refunded
+
+  ReleaseDeclined:
+    Type: Task
+    Resource: ${ReleaseFn}
+    Parameters:
+      ctx.$: $
+      final: DECLINED
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 1
+        MaxAttempts: 5
+        BackoffRate: 2
+    Next: Declined
+
+  ToDLQ:
+    Type: Task
+    Resource: arn:aws:states:::sqs:sendMessage
+    Parameters:
+      QueueUrl: ${DlqUrl}
+      MessageBody.$: States.JsonToString($)
+    ResultPath: null
+    Next: NeedsManualReview
+
+  NeedsManualReview:
+    Type: Fail
+    Error: NeedsManualReview
+    Cause: Compensation failed after retries; the order was sent to the dead-letter queue
+
+  Booked:
+    Type: Succeed
+  Refunded:
+    Type: Succeed
+  Declined:
+    Type: Succeed
+  PendingReconcile:
+    Type: Succeed
+  DuplicateIgnored:
+    Type: Succeed
+  SeatTaken:
+    Type: Succeed

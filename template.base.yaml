@@ -1,0 +1,592 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Tatkal payment-booking consistency project (core stack, v5 - with the backoff recheck experiment).
+  DynamoDB tables, mock payment gateway, NAIVE flow, Step Functions SAGA, reconciler,
+  dead-letter queue + alarms, dashboard, batch runner. Delete the stack to remove everything.
+
+Parameters:
+  HoldSeconds:
+    Type: Number
+    Default: 120
+    Description: How long a seat hold lasts before it expires (DynamoDB TTL attribute holdExpiresAt)
+  ReconcilerMode:
+    Type: String
+    Default: SCAN
+    AllowedValues: [SCAN, BACKOFF]
+    Description: >
+      Who follows up on a payment whose result is unknown. SCAN = one reconciler sweeps every minute (baseline).
+      BACKOFF = each such payment gets its own recheck workflow that waits 2, 4, 8, 16, 32, 64 seconds between bank checks.
+
+Conditions:
+  IsScan: !Equals [!Ref ReconcilerMode, SCAN]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Tags:
+      project: tatkal
+    Environment:
+      Variables:
+        SEATS_TABLE: !Ref SeatsTable
+        PAYMENTS_TABLE: !Ref PaymentsTable
+        BOOKINGS_TABLE: !Ref BookingsTable
+        EVENTS_TABLE: !Ref EventsTable
+        ORDERS_TABLE: !Ref OrdersTable
+        HOLD_SECONDS: !Ref HoldSeconds
+        RECON_MODE: !Ref ReconcilerMode
+
+Resources:
+  # ------------------------------------------------------------------ data
+  # Seats: one item per seat. holdExpiresAt is the TTL attribute (epoch seconds).
+  SeatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-seats
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: seatId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+        - AttributeName: seatId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: holdExpiresAt
+        Enabled: true
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Payments: the mock gateway's own ledger (where money was "debited").
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-payments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Bookings: issued tickets.
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-bookings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: bookingId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: bookingId
+          KeyType: HASH
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Events: step-by-step log per transaction, used for the UI timeline.
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-events
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: txnId
+          AttributeType: S
+        - AttributeName: ts
+          AttributeType: S
+      KeySchema:
+        - AttributeName: txnId
+          KeyType: HASH
+        - AttributeName: ts
+          KeyType: RANGE
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Orders: the saga's own record per idempotency key (HELD, PAID, PAYMENT_UNKNOWN, CONFIRMED, REFUNDED ...).
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tatkal-orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # Dead-letter queue: orders that still fail after all retries wait here for a human.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: tatkal-dlq
+      MessageRetentionPeriod: 345600
+      Tags:
+        - Key: project
+          Value: tatkal
+
+  # ------------------------------------------------------------ mock gateway
+  GatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-gateway
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: default
+      InlineCode: |
+__CODE_gateway__
+
+  # ------------------------------------------------------------- naive flow
+  NaiveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-naive
+      Handler: index.handler
+      Timeout: 30
+      # Public URL used instead of API Gateway. Try: <url>?mode=TIMEOUT_BUT_CHARGED
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+      InlineCode: |
+__CODE_naive__
+
+  # --------------------------------------------------------------- the saga
+  SagaReserveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-reserve
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      InlineCode: |
+__CODE_saga_reserve__
+
+  SagaPayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-pay
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+      InlineCode: |
+__CODE_saga_pay__
+
+  SagaConfirmFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-confirm
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      InlineCode: |
+__CODE_saga_confirm__
+
+  SagaRefundFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-refund
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+      InlineCode: |
+__CODE_saga_refund__
+
+  SagaReleaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-release
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      InlineCode: |
+__CODE_saga_release__
+
+  # Standard workflow: you can open each execution and see the graph (screenshots).
+  SagaStandardMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: tatkal-saga
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReserveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaPayFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaConfirmFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaRefundFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReleaseFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RecheckMachine
+      DefinitionSubstitutions:
+        ReserveFn: !GetAtt SagaReserveFunction.Arn
+        PayFn: !GetAtt SagaPayFunction.Arn
+        ConfirmFn: !GetAtt SagaConfirmFunction.Arn
+        RefundFn: !GetAtt SagaRefundFunction.Arn
+        ReleaseFn: !GetAtt SagaReleaseFunction.Arn
+        DlqUrl: !Ref DeadLetterQueue
+        ReconMode: !Ref ReconcilerMode
+        RecheckSm: !Ref RecheckMachine
+      Definition:
+__ASL__
+
+  # Express copy of the same definition: returns the result immediately (used by the page and the batch).
+  SagaExpressMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: tatkal-saga-express
+      Type: EXPRESS
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReserveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaPayFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaConfirmFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaRefundFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SagaReleaseFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RecheckMachine
+      DefinitionSubstitutions:
+        ReserveFn: !GetAtt SagaReserveFunction.Arn
+        PayFn: !GetAtt SagaPayFunction.Arn
+        ConfirmFn: !GetAtt SagaConfirmFunction.Arn
+        RefundFn: !GetAtt SagaRefundFunction.Arn
+        ReleaseFn: !GetAtt SagaReleaseFunction.Arn
+        DlqUrl: !Ref DeadLetterQueue
+        ReconMode: !Ref ReconcilerMode
+        RecheckSm: !Ref RecheckMachine
+      Definition:
+__ASL__
+
+  # Novelty: one small workflow per unclear payment. It waits, asks the bank, waits twice as long, asks again.
+  # Used only when ReconcilerMode = BACKOFF (the saga starts it); in SCAN mode it is never started.
+  RecheckMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: tatkal-recheck
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReconcilerFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+      DefinitionSubstitutions:
+        ReconcilerFn: !GetAtt ReconcilerFunction.Arn
+        DlqUrl: !Ref DeadLetterQueue
+      Definition:
+__ASL_RECHECK__
+
+  SagaStartFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-saga-start
+      Handler: index.handler
+      Timeout: 60
+      # Public URL. Try: <url>?mode=TIMEOUT_BUT_CHARGED   (add &std=1 to watch the graph in the console)
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Environment:
+        Variables:
+          EXPRESS_SM: !Ref SagaExpressMachine
+          STANDARD_SM: !Ref SagaStandardMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: states:StartSyncExecution
+              Resource: !Ref SagaExpressMachine
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref SagaStandardMachine
+      InlineCode: |
+__CODE_saga_start__
+
+  # ------------------------------------------------------------- reconciler
+  ReconcilerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-reconciler
+      Handler: index.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          GATEWAY_FN: !Ref GatewayFunction
+          DLQ_URL: !Ref DeadLetterQueue
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GatewayFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            State: !If [IsScan, ENABLED, DISABLED]
+      InlineCode: |
+__CODE_reconciler__
+
+  # ------------------------------------------------------ ledger + batch runner
+  LedgerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-ledger
+      Handler: index.handler
+      Timeout: 60
+      # Public read-only totals and timelines. Reset is blocked when called through the URL.
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SeatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      InlineCode: |
+__CODE_ledger__
+
+  BatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-batch
+      Handler: index.handler
+      Timeout: 300
+      # Public URL. Try: <url>?n=200&failPct=30
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: ['GET']
+      Environment:
+        Variables:
+          NAIVE_FN: !Ref NaiveFunction
+          LEDGER_FN: !Ref LedgerFunction
+          EXPRESS_SM: !Ref SagaExpressMachine
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref NaiveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LedgerFunction
+        - Statement:
+            - Effect: Allow
+              Action: states:StartSyncExecution
+              Resource: !Ref SagaExpressMachine
+      InlineCode: |
+__CODE_batch__
+
+  # First Lambda from Session 0: writes one row to the Events table.
+  PingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tatkal-ping
+      Handler: index.handler
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+      Events:
+        PingApi:
+          Type: HttpApi
+          Properties:
+            Path: /ping
+            Method: GET
+      InlineCode: |
+        import json, os, uuid, datetime
+        import boto3
+
+        table = boto3.resource("dynamodb").Table(os.environ["EVENTS_TABLE"])
+
+        def handler(event, context):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            item = {
+                "txnId": "ping-" + uuid.uuid4().hex[:8],
+                "ts": now,
+                "step": "PING",
+                "message": "Lambda reached DynamoDB",
+            }
+            table.put_item(Item=item)
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"ok": True, "wrote": item}),
+            }
+
+  # ----------------------------------------------------- alarms and dashboard
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tatkal-dlq-not-empty
+      AlarmDescription: An order needs manual review (it failed after all retries)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  SagaFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tatkal-saga-failed
+      AlarmDescription: A saga execution ended in NeedsManualReview
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref SagaExpressMachine
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: tatkal
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Orphaned payments (paid, no ticket) by flow", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [["Tatkal", "OrphanedPayments", "Flow", "NAIVE"], ["Tatkal", "OrphanedPayments", "Flow", "SAGA"]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Duplicate charges by flow", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [["Tatkal", "DuplicateCharges", "Flow", "NAIVE"], ["Tatkal", "DuplicateCharges", "Flow", "SAGA"]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Saga executions (Express)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+            "metrics": [["AWS/States", "ExecutionsStarted", "StateMachineArn", "${SagaExpressMachine}"], [".", "ExecutionsSucceeded", ".", "."], [".", "ExecutionsFailed", ".", "."]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Lambda invocations and errors", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+            "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "tatkal-naive"], [".", ".", ".", "tatkal-saga-pay"], [".", ".", ".", "tatkal-reconciler"], [".", "Errors", ".", "tatkal-gateway"], [".", ".", ".", "tatkal-saga-confirm"]]}},
+          {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
+            "title": "Dead-letter queue: orders waiting for a human", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "tatkal-dlq"]]}},
+          {"type": "alarm", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
+            "title": "Alarms", "alarms": ["${DlqAlarm.Arn}", "${SagaFailedAlarm.Arn}"]}}
+        ]}
+
+Outputs:
+  NaiveUrl:
+    Description: Naive flow in a browser, e.g. add ?mode=TIMEOUT_BUT_CHARGED
+    Value: !GetAtt NaiveFunctionUrl.FunctionUrl
+  SagaUrl:
+    Description: Saga flow in a browser, e.g. add ?mode=TIMEOUT_BUT_CHARGED
+    Value: !GetAtt SagaStartFunctionUrl.FunctionUrl
+  LedgerUrl:
+    Description: Totals (add ?flow=NAIVE or ?flow=SAGA) or a timeline (add ?events=TXN_ID)
+    Value: !GetAtt LedgerFunctionUrl.FunctionUrl
+  BatchUrl:
+    Description: Runs the same N scenarios through both flows (add ?n=200&failPct=30). Takes about 2 minutes.
+    Value: !GetAtt BatchFunctionUrl.FunctionUrl
+  DlqUrl:
+    Description: Dead-letter queue URL
+    Value: !Ref DeadLetterQueue
+  PingUrl:
+    Description: Public test URL (may show "Healthy Connection" while the account is being verified)
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ping"

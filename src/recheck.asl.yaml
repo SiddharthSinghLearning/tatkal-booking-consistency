@@ -1,0 +1,223 @@
+Comment: Per-payment recheck with exponential backoff. Wait a little, ask the bank, wait twice as long, ask again.
+StartAt: Wait1
+States:
+  Wait1:
+    Type: Wait
+    Seconds: 2
+    Next: Check1
+
+  Check1:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${ReconcilerFn}
+      Payload:
+        orderId.$: $.orderKey
+    ResultSelector:
+      open.$: $.Payload.open
+    ResultPath: $.check
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: Wait2
+    Next: Done1
+
+  Done1:
+    Type: Choice
+    Choices:
+      - Variable: $.check.open
+        NumericEquals: 0
+        Next: Resolved
+    Default: Wait2
+
+  Wait2:
+    Type: Wait
+    Seconds: 4
+    Next: Check2
+
+  Check2:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${ReconcilerFn}
+      Payload:
+        orderId.$: $.orderKey
+    ResultSelector:
+      open.$: $.Payload.open
+    ResultPath: $.check
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: Wait3
+    Next: Done2
+
+  Done2:
+    Type: Choice
+    Choices:
+      - Variable: $.check.open
+        NumericEquals: 0
+        Next: Resolved
+    Default: Wait3
+
+  Wait3:
+    Type: Wait
+    Seconds: 8
+    Next: Check3
+
+  Check3:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${ReconcilerFn}
+      Payload:
+        orderId.$: $.orderKey
+    ResultSelector:
+      open.$: $.Payload.open
+    ResultPath: $.check
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: Wait4
+    Next: Done3
+
+  Done3:
+    Type: Choice
+    Choices:
+      - Variable: $.check.open
+        NumericEquals: 0
+        Next: Resolved
+    Default: Wait4
+
+  Wait4:
+    Type: Wait
+    Seconds: 16
+    Next: Check4
+
+  Check4:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${ReconcilerFn}
+      Payload:
+        orderId.$: $.orderKey
+    ResultSelector:
+      open.$: $.Payload.open
+    ResultPath: $.check
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: Wait5
+    Next: Done4
+
+  Done4:
+    Type: Choice
+    Choices:
+      - Variable: $.check.open
+        NumericEquals: 0
+        Next: Resolved
+    Default: Wait5
+
+  Wait5:
+    Type: Wait
+    Seconds: 32
+    Next: Check5
+
+  Check5:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${ReconcilerFn}
+      Payload:
+        orderId.$: $.orderKey
+    ResultSelector:
+      open.$: $.Payload.open
+    ResultPath: $.check
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: Wait6
+    Next: Done5
+
+  Done5:
+    Type: Choice
+    Choices:
+      - Variable: $.check.open
+        NumericEquals: 0
+        Next: Resolved
+    Default: Wait6
+
+  Wait6:
+    Type: Wait
+    Seconds: 64
+    Next: Check6
+
+  Check6:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${ReconcilerFn}
+      Payload:
+        orderId.$: $.orderKey
+    ResultSelector:
+      open.$: $.Payload.open
+    ResultPath: $.check
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        MaxAttempts: 4
+        BackoffRate: 2
+    Catch:
+      - ErrorEquals: [States.ALL]
+        ResultPath: $.error
+        Next: GiveUp
+    Next: Done6
+
+  Done6:
+    Type: Choice
+    Choices:
+      - Variable: $.check.open
+        NumericEquals: 0
+        Next: Resolved
+    Default: GiveUp
+
+  GiveUp:
+    Type: Task
+    Resource: arn:aws:states:::sqs:sendMessage
+    Parameters:
+      QueueUrl: ${DlqUrl}
+      MessageBody.$: States.JsonToString($)
+    ResultPath: null
+    Next: NeedsManualReview
+
+  NeedsManualReview:
+    Type: Fail
+    Error: NeedsManualReview
+    Cause: The bank never settled this payment within the recheck schedule; a human must look at it
+
+  Resolved:
+    Type: Succeed
