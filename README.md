@@ -70,4 +70,4 @@ Simulated bank, 200-booking scale, new-account Lambda throttling, one run per re
 
 ## Authors
 
-Siddharth Singh (24BCI0158) and team members, VIT Vellore.
+Siddharth Singh
